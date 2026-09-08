@@ -2566,8 +2566,12 @@ def _export_json(path, e, res, quests, eq, idle, warn, slot, avail=None, ks=None
     d = os.path.dirname(path)
     if d and not os.path.isdir(d):
         os.makedirs(d)
-    with open(path, 'w', encoding='utf-8') as f:
+    # Ecriture ATOMIQUE : le mod scrute l'apparition du fichier pour savoir que
+    # le calcul est fini. Ecrit en place, il pourrait le lire a moitie ecrit.
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(doc, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
     print('json    : %s (%d quete(s), %d chevalier(s) equipe(s))'
           % (path, len(assignments), len(equipment)))
 

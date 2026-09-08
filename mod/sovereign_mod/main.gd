@@ -39,7 +39,13 @@ const HINTS_OUT := MOD_DIR + "hints_out.json"
 # Ticks (of 0.3 s) before a spawned solver is considered lost.
 const MAX_WAIT := 40
 
-const COMMANDS := ["state", "assign", "clear", "scene", "quests", "knights",
+## The full plan is a different animal from the live score: it searches every
+## combination of knights, quests and equipment, and takes about twenty seconds on
+## a full round table. It gets its own, far longer, leash.
+const PLAN_MAX_WAIT := 300         # ticks of 0.3 s -> 90 s
+const SPINNER := ["|", "/", "-", "\\"]
+
+const COMMANDS := ["state", "assign", "report", "clear", "scene", "quests", "knights",
                    "load", "table", "tree", "achievements", "clean_achievements",
                    "test_lock", "test_required", "wheel", "outcomes", "test_outcome",
                    "scores", "options", "options_state", "choices", "test_choice"]
@@ -131,6 +137,11 @@ var _scores := {}                  # quest_id -> score text
 var _last_plan := {}               # last plan applied, for the live advice
 var _plan_board := ""              # quests on the board when that plan was made
 var _last_report := ""             # result of the last action, for the test bench
+var _plan_pending := false         # a plan is being computed right now
+var _plan_wait := 0                # ticks spent waiting for it
+var _plan_freed := 0               # what the pre-clear removed, kept for the report
+var _plan_stripped := 0
+var _spin := 0                     # current frame of the loader
 
 
 func _ready() -> void:
@@ -170,6 +181,8 @@ func _start_display() -> void:
 
 
 func _update_display() -> void:
+    # A plan being computed in the background: check whether it has landed.
+    _poll_solver()
     # Visibility follows the setting AND the presence of the round table, re-read
     # every tick: unticking the box hides the panel immediately.
     if is_instance_valid(_options_button):
@@ -1021,7 +1034,13 @@ func _run_command(name: String) -> String:
                 ("absent" if not is_instance_valid(_roundtable) else "present")]
         "assign":
             _on_pressed()
-            return "\"Ideal assignment\" pressed\n" + _last_report
+            # The solver now runs in the background: the report is not ready yet.
+            # Ask again with "report" once the panel stops spinning.
+            return ("\"Ideal assignment\" pressed - computing in the background"
+                    if _plan_pending else "\"Ideal assignment\" pressed\n" + _last_report)
+        "report":
+            return ("still computing (%ds)" % int(_plan_wait * 0.3)
+                    if _plan_pending else _last_report)
         "clear":
             _on_clear_pressed()
             return "\"Clear all\" pressed\n" + _last_report
@@ -1800,10 +1819,12 @@ func _unhandled_input(event: InputEvent) -> void:
         get_viewport().set_input_as_handled()
 
 
-func _set_status(msg: String) -> void:
+## `quiet` for the loader: it speaks every 0.3 s and would drown the log.
+func _set_status(msg: String, quiet: bool = false) -> void:
     if is_instance_valid(_status):
         _status.text = msg
-    _log(msg)
+    if not quiet:
+        _log(msg)
 
 
 func _log(msg: String) -> void:
@@ -1938,7 +1959,10 @@ func _script_is(n: Node, suffix: String) -> bool:
 func _on_node_added(n: Node) -> void:
     if _script_is(n, "scenes/roundtable/quests_presentation_section.gd"):
         _section = n
-        _set_status("ready")
+        # Not while a plan is being computed: clearing the board rebuilds this
+        # section, and "ready" would wipe the loader off the panel.
+        if not _plan_pending:
+            _set_status("ready")
     elif _script_is(n, "scenes/roundtable/roundtable_container.gd"):
         _roundtable = n
     elif _script_is(n, "scenes/home/home.gd"):
@@ -1977,25 +2001,22 @@ func _on_pressed() -> void:
     if not is_instance_valid(_section):
         _set_status("round table not found")
         return
+    if _plan_pending:
+        return
     _button.disabled = true
     # Always start from an empty board. Applying on top of an existing assignment left
     # leftovers behind: a knight the plan does not use stayed on his quest, and gear the
     # plan wanted was still worn by someone else, so it could not be handed over.
     # Clearing first makes the button idempotent - press it twice, get the same board.
-    var freed := _clear_assignments()
-    var stripped := _unequip_all()
-    _set_status("computing...")
-    var plan := _run_solver()
-    if plan.is_empty():
+    _plan_freed = _clear_assignments()
+    _plan_stripped = _unequip_all()
+    if not _start_solver():
         _button.disabled = false
         return
-    # The report is kept for the test bench but not shown: on a normal run it only
-    # restated what the player just watched happen on the board. The status line
-    # stays for problems, which is when it actually carries information.
-    _last_report = ("cleared %d knight(s) and %d item(s)
-" % [freed, stripped]) + _apply(plan)
-    _set_status("")
-    _button.disabled = false
+    _plan_pending = true
+    _plan_wait = 0
+    _spin = 0
+    _tick_loader()
 
 
 
@@ -2079,13 +2100,17 @@ func _ensure_cache() -> bool:
     return true
 
 
-## Runs the solver and reads back the JSON it just wrote.
-## The solver takes ~0.1 s: a blocking call goes unnoticed.
-func _run_solver() -> Dictionary:
+## Starts the solver WITHOUT blocking, and returns whether it got going.
+##
+## It searches every combination of knights and equipment and takes about twenty
+## seconds on a full round table - `OS.execute` froze the whole game for all of it.
+## Same mechanism as the live score: the answer's arrival is signalled by the file
+## appearing, so the old one goes first. The solver writes it atomically, which is
+## what makes "the file is there" mean "the file is complete".
+func _start_solver() -> bool:
     if not _ensure_cache():
         _set_status("solver not found - reinstall the mod in the game folder")
-        return {}
-    var output := []
+        return false
     var args := ["cycle", str(settings.get("slot", 1)),
                  "--json=" + ProjectSettings.globalize_path(PLAN_PATH)]
     # The save is written at the end of a cycle, so a room opened DURING the cycle
@@ -2098,12 +2123,51 @@ func _run_solver() -> Dictionary:
         var id := String(room.resource_path).get_file().get_basename()
         if id != "":
             args.append("--room=" + id)
-    var code := OS.execute(_solver_exe, _solver_argv(args), output, true)
-    if code != 0:
-        _set_status("the solver failed (code %d)" % code)
-        for line in output:
-            _log(String(line))
-        return {}
+    DirAccess.remove_absolute(ProjectSettings.globalize_path(PLAN_PATH))
+    var pid := OS.create_process(_solver_exe, _solver_argv(args))
+    if pid <= 0:
+        _set_status("the solver could not start")
+        return false
+    return true
+
+
+## Watched on every display tick. Applies the plan as soon as it lands.
+func _poll_solver() -> void:
+    if not _plan_pending:
+        return
+    if FileAccess.file_exists(PLAN_PATH):
+        _plan_pending = false
+        if is_instance_valid(_button):
+            _button.disabled = false
+        var plan := _read_plan()
+        if plan.is_empty():
+            return
+        # The report is kept for the test bench but not shown: on a normal run it only
+        # restated what the player just watched happen on the board. The status line
+        # stays for problems, which is when it actually carries information.
+        _last_report = ("cleared %d knight(s) and %d item(s)
+" % [_plan_freed, _plan_stripped]) + _apply(plan)
+        _set_status("")
+        return
+    _plan_wait += 1
+    if _plan_wait > PLAN_MAX_WAIT:
+        _plan_pending = false
+        if is_instance_valid(_button):
+            _button.disabled = false
+        _set_status("the solver timed out")
+        return
+    _tick_loader()
+
+
+## The loader. There is no progress to report - the solver gives no intermediate
+## signal - so it shows that something IS happening, and for how long.
+func _tick_loader() -> void:
+    _spin = (_spin + 1) % SPINNER.size()
+    _set_status("%s  working out the best assignment...  %ds"
+                % [SPINNER[_spin], int(_plan_wait * 0.3)], true)
+
+
+func _read_plan() -> Dictionary:
     var f := FileAccess.open(PLAN_PATH, FileAccess.READ)
     if f == null:
         _set_status("plan.json unreadable")
