@@ -415,8 +415,17 @@ def random_knights():
         return {}
 
 
+_ISRAND = {}
+
+
 def is_random(name):
-    return name in random_knights()
+    # Appelee des millions de fois par l'optimiseur pour un test qui ne change
+    # jamais au cours d'un plan.
+    r = _ISRAND.get(name)
+    if r is None:
+        r = name in random_knights()
+        _ISRAND[name] = r
+    return r
 
 
 def mc_evaluate(qid, team, oc, meals=True, n=3000):
@@ -1862,10 +1871,48 @@ def optimise_cycle(assign, ks, oc, avail, gold, meals, pend, mc_n=1500, _no_cons
     levels = {n: [] for n in pend if n in used_kn}
     meal = [None]
 
+    # La contribution d'une quete ne depend QUE de son equipe, de l'equipement de
+    # cette equipe, de ses montees de niveau et du repas. Or l'optimiseur ne deplace
+    # qu'un objet a la fois : sans ce cache, les trois autres quetes du plan etaient
+    # integralement recalculees a chaque essai. C'est ce qui faisait 154 000 appels
+    # a score_all et 1,5 million d'habillages de chevalier.
+    _sa_memo = {}
+    # Tout ce qui ne depend que de (quete, equipe) est fige ici : la fiche de quete,
+    # sa duree de base, l'effectif, et le fait qu'une recrue aleatoire y figure.
+    # Recalcule dans la boucle, ca representait 1,4 million de recherches de quete
+    # et 3,6 millions d'appels a is_random pour des reponses toujours identiques.
+    _sa_prep = []
+    for _qid, _team in assign:
+        _qq = MODS.get(_qid) or C('quests')[_qid]
+        _sa_prep.append((_qid, _team, tuple(_team),
+                         any(is_random(n) for n in _team),
+                         _qq, _qq.get('duration', 1), len(_team)))
+
     def score_all(state, levels, meal_on):
         tot = 0.0
         det = []
-        for qid, team in assign:
+        for qid, team, team_t, alea, _q, _base_d, _nb in _sa_prep:
+            # Une equipe a recrue aleatoire passe par mc_evaluate, qui tire au sort :
+            # la mettre en cache figerait le tirage. On ne la memorise pas.
+            memo_key = None
+            if not alea:
+                # Comprehensions de liste et non generateurs : la clef est
+                # construite des millions de fois, et un generateur paie un cadre
+                # d'execution par element.
+                memo_key = (qid, team_t, meal_on in team,
+                            tuple([tuple(sorted(state.get(n) or ())) for n in team]),
+                            tuple([tuple(levels.get(n) or ()) for n in team]))
+                hit = _sa_memo.get(memo_key)
+                if hit is not None:
+                    # Termes reappliques UN A UN, dans l'ordre d'origine : une somme
+                    # pre-agregee differerait d'un ULP et pourrait retourner une
+                    # egalite entre deux plans.
+                    tot += hit[0]
+                    tot += hit[1]
+                    tot += hit[2]
+                    tot += hit[3]
+                    det.append(hit[4])
+                    continue
             kl = []
             for n in team:
                 k = _dress(bare[n], state.get(n, []), eq)
@@ -1873,7 +1920,7 @@ def optimise_cycle(assign, ks, oc, avail, gold, meals, pend, mc_n=1500, _no_cons
                     k['stats'][s] = k['stats'].get(s, 0) + 1
                 kl.append(k)
             m = 1 if meal_on in team else 0
-            if any(is_random(n) for n in team):
+            if alea:
                 mc = mc_evaluate(qid, kl, oc, m, n=mc_n)
                 s = mc['mean'] if mc else -99
                 o = ' '.join('%s %.0f%%' % (SHORT.get(a, a), b0) for a, b0 in list(mc['probs'].items())[:3]) if mc else '?'
@@ -1887,14 +1934,14 @@ def optimise_cycle(assign, ks, oc, avail, gold, meals, pend, mc_n=1500, _no_cons
             # Un CYCLE GAGNE libere toute l'equipe un tour plus tot : ca pese autant
             # qu'un demi-palier. Sans ca l'optimiseur laissait un equipier sans monture
             # et annulait la reduction des trois autres (cycle 14, Goberto).
-            _q = MODS.get(qid) or C('quests')[qid]
+            # _q, _base_d et _nb viennent de _sa_prep.
             # Un cycle gagne libere TOUTE l'equipe un tour plus tot : le gain est
             # proportionnel a l'effectif, pas forfaitaire. Le poids fixe de 1,5 sous-evaluait
             # une quete de 3 cycles a 2 chevaliers face a quelques reliques (cycle 11, le
             # remede des sirenes bloquait Ursule et Arron jusqu'au cycle 14).
-            _base_d = _q.get('duration', 1)
             _real_d = team_duration(_q, team, state)
-            tot += 1.5 * len(team) * (_base_d - _real_d)
+            _t_dur = 1.5 * _nb * (_base_d - _real_d)
+            tot += _t_dur
             # RAMENER UNE QUETE A UN SEUL CYCLE PASSE AVANT LE SCORE. Regle posee par le
             # user au cycle 18 : l'exploratrice (duree 3, 3 slots) partait avec trois
             # montures a -1 pour 2 cycles, alors que trois montures a -2 -- toutes
@@ -1902,10 +1949,16 @@ def optimise_cycle(assign, ks, oc, avail, gold, meals, pend, mc_n=1500, _no_cons
             # par chevalier) ne pesait pas assez face a quelques points de score.
             # Le bonus est conditionne au palier : gagner un cycle en ratant la quete
             # n'est pas un gain, donc rien en dessous de REUSSITE.
+            _t_bonus = 0.0
             if _base_d > 1 and _real_d <= 1 and _RKf(o) >= 3:
-                tot += ONE_CYCLE_BONUS * len(team)
-            tot += AFFINITY_TIEBREAK * affinity_gain(team, o, ks)
-            det.append((qid, team, round(s, 2), o))
+                _t_bonus = ONE_CYCLE_BONUS * _nb
+                tot += _t_bonus
+            _t_aff = AFFINITY_TIEBREAK * affinity_gain(team, o, ks)
+            tot += _t_aff
+            _entry = (qid, team, round(s, 2), o)
+            det.append(_entry)
+            if memo_key is not None:
+                _sa_memo[memo_key] = (s, _t_dur, _t_bonus, _t_aff, _entry)
         return tot, det
 
     # 1) montees de niveau sur l'affectation reelle
