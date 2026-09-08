@@ -3387,6 +3387,85 @@ def _near_effects(name, pos, depth=1, _seen=None):
     return uniq
 
 
+# Une garde d'option est compilee par ink en NOTATION POSTFIXEE :
+#   {"VAR?":"a"},"!",{"VAR?":"b"},"!","&&"   se lit   « ni a ni b ».
+# L'ancienne lecture listait les variables a plat et annoncait « NON acquise,
+# option CACHEE » : l'inverse de la verite sur les 393 negations du scenario.
+_CMP = {'>=': lambda a, b: a >= b, '<=': lambda a, b: a <= b,
+        '>': lambda a, b: a > b, '<': lambda a, b: a < b,
+        '==': lambda a, b: a == b, '!=': lambda a, b: a != b}
+
+_COND_TOK = re.compile(r'\{"VAR\?":"([a-z][a-z0-9_]{3,60})"\}'
+                       r'|\{"CNT\?":"([^"]+)"\}'
+                       r'|"(!|&&|\|\||>=|<=|==|!=|>|<)"'
+                       r'|(?<![\w."])(-?\d+)(?![\w."])')
+
+
+def _cond_parse(seg):
+    """(jetons, tout_reconnu). Ce qui reste hors jetons trahit une garde qu'on
+    ne sait pas lire : mieux vaut le dire que de deviner."""
+    toks, reste, prev = [], [], 0
+    for m in _COND_TOK.finditer(seg or ''):
+        reste.append(seg[prev:m.start()])
+        prev = m.end()
+        if m.group(1):
+            toks.append(('var', m.group(1)))
+        elif m.group(2):
+            toks.append(('cnt', m.group(2).split('.')[-1]))
+        elif m.group(3):
+            toks.append(('op', m.group(3)))
+        else:
+            toks.append(('num', int(m.group(4))))
+    reste.append((seg or '')[prev:])
+    return toks, not ''.join(reste).strip(', \t')
+
+
+def _cond_non(t):
+    return t[4:] if t.startswith('NON ') else 'NON ' + t
+
+
+def _cond_eval(toks, inkvars):
+    """(expression lisible, visible). `visible` vaut None quand l'issue depend
+    d'un element hors sauvegarde (nombre de passages dans un noeud)."""
+    pile = []
+    for kind, val in toks:
+        if kind == 'var':
+            pile.append((bool(inkvars.get(val)), val))
+        elif kind == 'cnt':
+            pile.append((None, 'passages par %s' % val))
+        elif kind == 'num':
+            pile.append((val, str(val)))
+        elif val == '!':
+            if not pile:
+                return '', None
+            v, t = pile.pop()
+            pile.append((None if v is None else not v, _cond_non(t)))
+        elif val in ('&&', '||'):
+            if len(pile) < 2:
+                return '', None
+            b, tb = pile.pop()
+            a, ta = pile.pop()
+            if val == '&&':
+                r = False if (a is False or b is False) else (
+                    None if (a is None or b is None) else True)
+            else:
+                r = True if (a is True or b is True) else (
+                    None if (a is None or b is None) else False)
+            pile.append((r, '(%s %s %s)' % (ta, 'ET' if val == '&&' else 'OU', tb)))
+        else:
+            if len(pile) < 2:
+                return '', None
+            b, tb = pile.pop()
+            a, ta = pile.pop()
+            f = _CMP.get(val)
+            r = f(a, b) if (f and isinstance(a, int) and isinstance(b, int)) else None
+            pile.append((r, '%s %s %s' % (ta, val, tb)))
+    if len(pile) != 1:
+        return '', None
+    v, t = pile[0]
+    return (t[1:-1] if t.startswith('(') and t.endswith(')') else t), v
+
+
 def _choices_detailed(knot, pos=0):
     """[(libelle, [requis], [effets])] pour un knot d'audience.
     st.ink_choices() ne rend pas les RequiresTag ; or c'est exactement ce qui
@@ -3413,8 +3492,9 @@ def _choices_detailed(knot, pos=0):
                re.findall(r'\{"VAR\?":"(\w+)"\},(\d+),\{"f\(\)":"RequiresTag"\}', head)]
         req += [('satisfaction', a, int(b)) for a, b in
                 re.findall(r'\{"VAR\?":"(\w+)"\},(\d+),\{"f\(\)":"RequiresMinSatisfaction"\}', head)]
-        req += [('variable', a, 1) for a in
-                re.findall(r'\{"VAR\?":"([a-z][a-z0-9_]{3,60})"\}', m.group(2))]
+        toks, entier = _cond_parse(m.group(2))
+        if toks:
+            req.append(('cond', toks, entier))
         labels.append((m.group(3), m.group(1), req))
         prev = m.end()
     blocks = {}
@@ -3482,11 +3562,27 @@ def _quest_card(qid, ks, oc, indent='   '):
         print(indent + '  echec   : %s' % ', '.join(fail))
     if q.get('success_follow_up'):
         print(indent + '  suite   : %s' % q['success_follow_up'])
+    # Les chevaliers imposes par la quete. En proposer d'autres n'a aucun sens :
+    # c'est ce qui m'a fait conseiller ARI sur la quete ou OLIVER est verrouille.
+    imposes = [x for x in (q.get('locked_knights') or []) if x in ks]
+    complet = imposes and len(imposes) >= (q.get('nb_knights') or 1)
+    if imposes:
+        print(indent + '  impose  : %s%s'
+              % (', '.join(x.upper() for x in imposes),
+                 '  (aucune place libre)' if complet
+                 else '  + %d place(s) libre(s)' % ((q.get('nb_knights') or 1)
+                                                    - len(imposes))))
     # Notes. Le seuil est par chevalier contre l'exigence COMPLETE : les stats
     # ne s'additionnent jamais entre membres de l'equipe.
     notes = []
     for n, k in ks.items():
-        if k['dead'] or k['busy']:
+        if k['dead']:
+            continue
+        # Un chevalier verrouille SUR CETTE QUETE est compte « occupe » : il doit
+        # quand meme figurer, c'est lui qui part.
+        if k['busy'] and n not in imposes:
+            continue
+        if complet and n not in imposes:
             continue
         try:
             s, out = st.score(qid, [k], meals=False, verbose=False, quest=MODS.get(qid))
@@ -3748,11 +3844,21 @@ def cmd_choix(argv):
             elif kind == 'satisfaction':
                 have, unite = sat.get(who.lower(), 0), 'satisfaction'
                 who = _CAT_FR.get(who.lower(), who)
-            else:
-                have, unite = (1 if inkvars.get(who) else 0), ''
-                print('    requiert : variable %s  -- %s'
-                      % (who, 'acquise, option VISIBLE' if have
-                         else 'NON acquise, option CACHEE'))
+            elif kind == 'cond':
+                expr, visible = _cond_eval(who, inkvars)
+                verdict = {True: 'option VISIBLE', False: '>>> option CACHEE <<<'}.get(
+                    visible, 'visibilite indeterminee')
+                if not expr or not need:
+                    verdict += ' (garde partiellement lue)'
+                print('    condition: %s  -- %s' % (expr or '?', verdict))
+                vus = []
+                for k2, v2 in who:
+                    if k2 == 'var' and v2 not in vus:
+                        vus.append(v2)
+                if vus:
+                    print('               %s' % '  |  '.join(
+                        '%s = %s' % (v2, 'oui' if inkvars.get(v2) else 'non')
+                        for v2 in vus))
                 continue
             print('    requiert : %s %s %d  -- tu as %d  %s'
                   % (who, unite, need, have,
