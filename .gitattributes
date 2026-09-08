@@ -1,0 +1,3 @@
+# Keep every file byte-for-byte as committed. main.gd is CRLF and the Godot
+# parser is picky enough that guessing is not worth the risk.
+* -text

@@ -1,0 +1,18 @@
+# Game data extracted from the player's own copy of Sovereign Tower.
+# Never redistributed: every user rebuilds it locally (st.py setup, or the mod
+# does it on first launch). It also holds save-file dumps.
+cache/
+
+# Release artefacts
+build/
+dist/
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+
+# Scratch
+*.bak
+*.bak_*
+runlog.md

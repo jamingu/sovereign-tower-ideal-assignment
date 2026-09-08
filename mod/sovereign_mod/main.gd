@@ -1,0 +1,2476 @@
+extends Node
+##
+## "Ideal assignment" mod - Sovereign Tower
+##
+## Loaded as the `SovereignMod` autoload through override.cfg, FROM DISK: this file
+## does not live inside sovereign_tower.pck, the game archive is untouched.
+## To uninstall: delete override.cfg and this folder.
+##
+## The mod computes NOTHING. st.py remains the solver; the mod runs the script,
+## reads the JSON it produces and applies the result to the interface.
+##
+## It only applies what is FREE and located at the round table: assignments and
+## equipment. Meals and purchases cost gold and live in other rooms - calling them
+## from here would hand out free items, which is cheating, and would invalidate the
+## gold budget st.py computed.
+##
+
+const MOD_DIR := "user://sovereign_mod/"
+const SETTINGS_PATH := MOD_DIR + "settings.json"
+const PLAN_PATH := MOD_DIR + "plan.json"
+
+## Test bench. The mod re-reads cmd.txt, expects ONE NAME from the fixed list below
+## (no expression evaluation: an unknown name is rejected) and writes the result to
+## out.txt. Lets the mod be checked from a terminal, on a real loaded save, without
+## pulling the player in for every trial.
+## Setting `test_bench`, to be turned off once tuning is over.
+const CMD_PATH := MOD_DIR + "cmd.txt"
+const OUT_PATH := MOD_DIR + "out.txt"
+
+## Exchange files for the live score: the mod writes the real board state, st.py
+## grades it and returns the scores.
+const LIVE_IN := MOD_DIR + "live_in.json"
+const LIVE_OUT := MOD_DIR + "live_out.json"
+
+## Same idea for audience choices: the mod sends the option labels, st.py digs the
+## rewards out of the ink script.
+const HINTS_IN := MOD_DIR + "hints_in.json"
+const HINTS_OUT := MOD_DIR + "hints_out.json"
+# Ticks (of 0.3 s) before a spawned solver is considered lost.
+const MAX_WAIT := 40
+
+const COMMANDS := ["state", "assign", "clear", "scene", "quests", "knights",
+                   "load", "table", "tree", "achievements", "clean_achievements",
+                   "test_lock", "test_required", "wheel", "outcomes", "test_outcome",
+                   "scores", "options", "options_state", "choices", "test_choice"]
+
+## Achievements fired by mistake during tuning: a "populate" command (since removed)
+## recruited the whole round table at once, which unlocked the recruitment
+## achievements on Steam. Restoring a save file does NOT undo them: they live on
+## Steam's servers.
+const ACHIEVEMENTS_TO_CLEAR := ["KNIGHTHOOD", "THE_STRONGEST_KNIGHT", "A_KNIGHTS_GAME"]
+
+## Every feature is an independent switch: the player wants to turn them on one by
+## one (see MOD_BACKLOG.md, point 5).
+const DEFAULTS := {
+    # Left empty, the mod finds sovereign_mod/solver/st.exe by itself: there is
+    # nothing to configure, wherever Steam put the game. Fill these in only to run
+    # the solver from its Python sources ("python" -> python.exe, "solver" -> st.py).
+    "python": "",
+    "solver": "",
+    "slot": 1,
+    "assignment_button": true,
+    "clear_button": true,
+    "test_bench": false,
+    "wheel_font_size": 32,
+    "unexpected_outcomes": true,
+    "wheel_numbers": true,
+    "buying_advice": true,
+    "live_score": true,
+    "audience_outcomes": true,
+    "audience_rewards": true,
+    "reward_names": true,
+    "meal_likes": true,
+    "fast_results": true,
+    "fix_ghost_portrait": true,
+    "result_speed": 2.0,
+}
+
+## What the options screen offers to tick: setting key -> label, in display order.
+const OPTIONS := [
+    ["assignment_button", "Show the \"Ideal assignment\" button"],
+    ["clear_button", "Show the \"Clear all\" button"],
+    ["wheel_numbers", "Show numbers on the difficulty wheel"],
+    ["unexpected_outcomes", "Show unexpected outcomes"],
+    ["live_score", "Live quest score"],
+    ["audience_outcomes", "Audience: show a quest's unexpected outcomes"],
+    ["audience_rewards", "Audience: name the relic / mount / consumable on offer"],
+    ["reward_names", "Name the relic / mount / consumable a quest promises"],
+    ["meal_likes", "Kitchen: flag the dishes a knight likes and dislikes"],
+    ["fast_results", "Speed up the end-of-cycle results screen"],
+    ["fix_ghost_portrait", "Round table: clear a portrait left behind by the swipe"],
+    ["buying_advice", "Buying and meal advice"],
+    ["test_bench", "Remote control (lets the assistant drive the game to test it)"],
+]
+
+var settings := {}
+
+var _layer: CanvasLayer
+var _panel: Panel
+var _button: Button
+var _clear_button: Button
+var _status: Label
+var _outcome_label: Label
+var _quest_label: Label           # name of the quest the score belongs to
+var _score_label: Label
+var _advice_label: Label          # "to buy" section
+var _meal_label: Label
+var _levels_label: Label
+var _score_sep: HSeparator
+var _meal_sep: HSeparator
+var _levels_sep: HSeparator
+var _buy_sep: HSeparator
+var _section: Node = null          # current QuestPresentationSection
+var _roundtable: Node = null       # current RoundtableContainer
+var _home: Node = null             # main menu
+var _tower: Node = null            # TowerViewContainer
+var _kitchen: Node = null          # Kitchen (meal selection)
+var _cycle_end: Node = null        # CycleTransitionContainer (end-of-cycle results)
+var _wheels: Array[Node] = []      # difficulty wheels to annotate
+var _choices: Array[Node] = []     # audience choice buttons to annotate
+var _rewards_shown: Array[Node] = []   # reward chips on the quest card
+var _choice_sig := ""              # labels on screen at the last ink lookup
+var _choice_pending := ""          # signature of the lookup currently running
+var _choice_wait := 0              # ticks spent waiting for that answer
+var _score_pending := false        # a score computation is running
+var _score_wait := 0               # ticks spent waiting for it
+var _rewards := {}                 # label -> reward text, kept across audiences
+var _tips := {}                    # button id -> {base, full} tooltip we wrote
+var _signature := ""               # board state at the last score computation
+var _scores := {}                  # quest_id -> score text
+var _last_plan := {}               # last plan applied, for the live advice
+var _plan_board := ""              # quests on the board when that plan was made
+var _last_report := ""             # result of the last action, for the test bench
+
+
+func _ready() -> void:
+    _load_settings()
+    get_tree().node_added.connect(_on_node_added)
+    get_tree().node_removed.connect(_on_node_removed)
+    # Everything is built and started unconditionally; each feature checks its own
+    # setting at run time. That is what lets a checkbox take effect mid-game without
+    # restarting.
+    _start_bench()
+    _start_display()
+    _build_ui()
+    _build_options()
+    _ensure_cache()
+    _log("ready (solver: %s)" % (_solver_exe if _solver_exe != "" else "NOT FOUND"))
+
+
+# ------------------------------------------------- numbers on the difficulty wheel
+#
+# The wheel (DifficultyHintWheel) shows six slices, one per statistic, each with a
+# Low / Mid / High / Max label. The exact required value is computed right next to
+# it, in DifficultyHint.define_difficulty(), but never displayed.
+#
+# We add the number WITHOUT touching the original display: an extra Label placed on
+# each slice. A requirement the game considers unknown stays "?" - showing its value
+# would hand the player information they have not earned.
+
+const LABEL_NAME := "SovModValue"
+
+
+func _start_display() -> void:
+    var t := Timer.new()
+    t.wait_time = 0.3
+    t.autostart = true
+    t.timeout.connect(_update_display)
+    add_child(t)
+
+
+func _update_display() -> void:
+    # Visibility follows the setting AND the presence of the round table, re-read
+    # every tick: unticking the box hides the panel immediately.
+    if is_instance_valid(_options_button):
+        _options_button.visible = is_instance_valid(_home) and _home.is_visible_in_tree()
+        if _options_button.visible:
+            _place_options_button()
+    if is_instance_valid(_button):
+        _button.visible = settings.get("assignment_button", true)
+    if is_instance_valid(_clear_button):
+        _clear_button.visible = settings.get("clear_button", true)
+    if is_instance_valid(_panel):
+        # The panel lives as long as it has anything to show: either button, or any
+        # of the read-outs.
+        var has_content: bool = (settings.get("assignment_button", true)
+                                 or settings.get("clear_button", true)
+                                 or settings.get("live_score", false)
+                                 or settings.get("buying_advice", false)
+                                 or settings.get("unexpected_outcomes", false))
+        # `is_instance_valid` alone was not enough: the game PRELOADS the round table
+        # and merely hides it when you leave, so the node stays alive and the panel
+        # lingered on screen well after the assignment was validated.
+        #
+        # But keying on the QUEST SECTION alone was too tight the other way: that
+        # section only appears once a quest is picked, so the panel stayed invisible
+        # for the whole first half of the round table. The container is the right
+        # unit - the panel belongs to the round table, not to one selection.
+        var board_up: bool = (is_instance_valid(_roundtable)
+                              and _roundtable.is_visible_in_tree())
+        if not board_up:
+            board_up = is_instance_valid(_section) and _section.is_visible_in_tree()
+        # The end-of-cycle results are drawn over the round table, which stays
+        # visible underneath: without this the panel comes back during the recap.
+        if is_instance_valid(_cycle_end) and _cycle_end.is_visible_in_tree():
+            board_up = false
+        _panel.visible = has_content and board_up
+        # First run: no stored position yet. Centre it horizontally and lift it
+        # ~300 px off the bottom so it clears the knight's name. Only computable
+        # once the viewport size is known.
+        if _panel.visible:
+            _fit_height()
+        if _panel.visible and _panel.position.x < 0:
+            var screen := _panel.get_viewport_rect().size
+            _panel.position = Vector2(screen.x * 0.5 - _panel.size.x * 0.5,
+                                      screen.y - _panel.size.y - 140.0)
+            _keep_on_screen()
+    if settings.get("wheel_numbers", false):
+        _update_wheels()
+    if settings.get("unexpected_outcomes", false):
+        _update_outcome()
+    if settings.get("live_score", false):
+        _update_score()
+    # Re-filtered every tick: coming back from the forge clears the "buy this" line
+    # on its own, no need to press the button again.
+    # Le plan survit a la fermeture de la table ronde, ce qui est voulu : revenir de la
+    # forge doit rafraichir le conseil d'achat sans re-cliquer. Mais il survivait AUSSI
+    # au changement de cycle : le panneau affichait encore les montees de niveau du tour
+    # precedent alors que le joueur n'avait rien demande. On le perime des que la liste
+    # des quetes du plateau change.
+    if not _last_plan.is_empty() and _quest_set() != _plan_board:
+        _last_plan = {}
+        _plan_board = ""
+        if is_instance_valid(_advice_label):
+            _advice_label.text = ""
+            _meal_label.text = ""
+            _levels_label.text = ""
+    if settings.get("buying_advice", false) and not _last_plan.is_empty():
+        _update_advice(_last_plan)
+    _refresh_rules()
+    if settings.get("fix_ghost_portrait", false):
+        _fix_ghost_portraits()
+    if settings.get("meal_likes", false):
+        _update_meal_likes()
+    if settings.get("reward_names", false):
+        _update_reward_chips()
+    if settings.get("audience_rewards", false):
+        _refresh_rewards()
+    if settings.get("audience_outcomes", false) or settings.get("audience_rewards", false):
+        _update_choices()
+
+
+func _update_wheels() -> void:
+    for i in range(_wheels.size() - 1, -1, -1):
+        var w: Node = _wheels[i]
+        if not is_instance_valid(w):
+            _wheels.remove_at(i)
+            continue
+        _annotate_wheel(w)
+
+
+func _annotate_wheel(w: Node) -> void:
+    var quest = w.current_quest
+    if not is_instance_valid(quest):
+        return
+    if w.portions == null:
+        return
+    var required := _requirements(quest, w.current_quest_modifiers)
+    for slice in w.portions.get_children():
+        if not ("statistic_id" in slice):
+            continue
+        # The game's own verdict tells apart "no requirement at all" (NONE, nothing
+        # to print) from "requirement the player has not discovered yet" (UNKNOWN,
+        # shown as "?" on the wheel). We never re-decide that: replicating
+        # define_difficulty() once printed a number where the game shows "?".
+        #
+        # An UNKNOWN requirement DOES have a value, and this setting reveals it -
+        # the player asked for it explicitly, under this same checkbox rather than
+        # one of its own. Unticking "numbers on the wheel" restores the game's
+        # discovery mechanic whole.
+        var text := ""
+        if slice.difficulty != DifficultyHint.Difficulties.NONE:
+            var stat = slice.statistic_id
+            text = str(int(required[stat])) if required.has(stat) else ""
+        _place_label(slice, text)
+
+
+## Mirrors DifficultyHint.define_difficulty(): base requirements, then the change
+## brought by the modifier picked at the audience.
+func _requirements(quest, mods) -> Dictionary:
+    var required: Dictionary = quest.stats_requirements.duplicate()
+    if is_instance_valid(mods):
+        for stat in mods.stats_requirements_modification.keys():
+            if required.has(stat):
+                required[stat] = max(0, required[stat] + mods.stats_requirements_modification[stat])
+            else:
+                required[stat] = max(mods.stats_requirements_modification[stat], 0)
+    return required
+
+
+func _place_label(slice: Node, text: String) -> void:
+    var lab: Label = slice.get_node_or_null(LABEL_NAME)
+    if text == "":
+        if lab != null:
+            lab.visible = false
+        return
+    if lab == null:
+        lab = Label.new()
+        lab.name = LABEL_NAME
+        lab.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+        lab.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+        lab.set_anchors_preset(Control.PRESET_FULL_RECT)
+        lab.mouse_filter = Control.MOUSE_FILTER_IGNORE
+        lab.add_theme_color_override("font_color", Color(1, 1, 1))
+        lab.add_theme_color_override("font_outline_color", Color(0, 0, 0))
+        var size: int = int(settings.get("wheel_font_size", 32))
+        lab.add_theme_font_size_override("font_size", size)
+        # Outline scales with the font: too thin and the digit vanishes on pale slices.
+        lab.add_theme_constant_override("outline_size", max(4, size / 4))
+        slice.add_child(lab)
+    lab.visible = true
+    lab.text = text
+    # Wheel slices are rotated; without compensation the label follows and a 6 placed
+    # at the bottom reads as a 9 - the player hit exactly that. Cancel the inherited
+    # rotation so every number stays upright.
+    lab.pivot_offset = lab.size / 2.0
+    lab.rotation = -slice.get_global_transform().get_rotation()
+
+
+# ------------------------------------------------------------------- live score
+#
+# The score comes from st.py, never from the game: `quest.determine_outcome()`
+# FREEZES the outcome and would trigger damage and rewards (see below).
+#
+# st.py rebuilds knights from the SAVE FILE, which lags behind the running game. So
+# we hand it the team AND the equipment actually in place, through `st.py live`; it
+# only keeps from the save what does not move.
+#
+# The call blocks (~0.2 s), so we only fire it when the board actually changed: the
+# signature below sums up the state, and while it is unchanged nothing runs.
+
+## The quests currently on the board, ignoring who is assigned to them. Identifies
+## the cycle for the purpose of expiring a stale plan.
+func _quest_set() -> String:
+    var ids := PackedStringArray()
+    for q in GameState.quests_manager.current_quests:
+        if is_instance_valid(q):
+            ids.append(String(q.quest_id))
+    ids.sort()
+    return ",".join(ids)
+
+
+func _board_signature() -> String:
+    var parts := PackedStringArray()
+    for q in GameState.quests_manager.current_quests:
+        if not is_instance_valid(q):
+            continue
+        var names := PackedStringArray()
+        for k in q.assigned_knights:
+            if not is_instance_valid(k):
+                continue
+            var items := PackedStringArray()
+            for eq in k.equipments:
+                if is_instance_valid(eq):
+                    items.append(String(eq.name))
+            items.sort()
+            # The stat total is part of the signature: without it a level-up or a
+            # training session changed nothing here, and the score stayed frozen.
+            var total := 0
+            for id in Knight.Statistics.values():
+                total += k.get_statistic_value_from_id(id, false)
+            names.append("%s[%s]%s#%d" % [String(k.character_ink_id), ",".join(items),
+                                          "M" if k.has_eaten else "", total])
+        names.sort()
+        if names.size() > 0:
+            parts.append("%s:%s" % [String(q.quest_id), ",".join(names)])
+    parts.sort()
+    return "|".join(parts)
+
+
+func _update_score() -> void:
+    if not is_instance_valid(_score_label):
+        return
+    if not is_instance_valid(_section):
+        _quest_label.text = ""
+        _score_label.text = ""
+        return
+    # Same rule as the audience lookup: never block the frame on Python. The panel
+    # keeps the previous figure until the new one lands, one or two ticks later.
+    if _score_pending:
+        _score_wait += 1
+        if _score_wait > MAX_WAIT:
+            _log("st.py live timed out")
+            _score_pending = false
+        else:
+            _collect_scores()
+    else:
+        var sig := _board_signature()
+        if sig != _signature:
+            _signature = sig
+            _recompute_scores()
+    var q = _section.selected_quest
+    if not is_instance_valid(q):
+        _quest_label.text = ""
+        _score_label.text = ""
+        return
+    # Duration next to the name: a knight sent on a 3-cycle quest is gone for three
+    # cycles, and nothing in this panel said so. calculate_updated_duration() is the
+    # game's own function and only reads - it applies the team's mount reduction.
+    var cycles: int = GameState.quests_manager.calculate_updated_duration(q)
+    _quest_label.text = "%s - %d cycle%s" % [tr(q.quest_name), cycles,
+                                             ("" if cycles == 1 else "s")]
+    # A special outcome whose conditions are met SHORT-CIRCUITS the whole thing:
+    # `determine_outcome()` returns UNEXPECTED_OUTCOME before scoring anything. The
+    # figure would be meaningless, so we do not show one.
+    if _outcome_triggered(q):
+        _score_label.text = "??/10 - UNEXPECTED OUTCOME"
+    else:
+        _score_label.text = _scores.get(String(q.quest_id), "no knight assigned")
+
+
+## Sends the real board state to st.py and collects the scores.
+func _recompute_scores() -> void:
+    # Keep the figures on screen while the new ones are computed: clearing here made
+    # the panel blink empty at every change.
+    var quests := []
+    # The knights' CURRENT statistics, equipment excluded (st.py adds the gear back
+    # from `equip`). The save does not know about a level-up made this cycle, so the
+    # score used to stay frozen after a "+1 WITS".
+    var stats := {}
+    for k in GameState.character_manager.roundtable_knights:
+        if not is_instance_valid(k):
+            continue
+        var row := {}
+        for id in Knight.Statistics.values():
+            row[Knight.Statistics.keys()[id]] = k.get_statistic_value_from_id(id, false)
+        stats[String(k.character_ink_id)] = row
+    for q in GameState.quests_manager.current_quests:
+        if not is_instance_valid(q):
+            continue
+        var names := []
+        var equip := {}
+        var fed := []
+        for k in q.assigned_knights:
+            if not is_instance_valid(k):
+                continue
+            var name := String(k.character_ink_id)
+            names.append(name)
+            var items := []
+            for eq in k.equipments:
+                if is_instance_valid(eq):
+                    items.append(String(eq.name))
+            equip[name] = items
+            if k.has_eaten:
+                fed.append(name)
+        if names.size() > 0:
+            quests.append({"quest_id": String(q.quest_id), "knights": names,
+                           "equip": equip, "has_eaten": fed})
+    if quests.is_empty():
+        _scores.clear()
+        return
+
+    var f := FileAccess.open(LIVE_IN, FileAccess.WRITE)
+    if f == null:
+        return
+    f.store_string(JSON.stringify({"slot": settings.get("slot", 1),
+                                   "stats": stats, "quests": quests}))
+    f.close()
+
+    if not _ensure_cache():
+        return
+    # The answer's arrival is signalled by the file appearing, so remove the old one.
+    DirAccess.remove_absolute(ProjectSettings.globalize_path(LIVE_OUT))
+    var pid := OS.create_process(_solver_exe, _solver_argv(["live",
+        "--in=" + ProjectSettings.globalize_path(LIVE_IN),
+        "--out=" + ProjectSettings.globalize_path(LIVE_OUT)]))
+    if pid <= 0:
+        _log("the live score could not start")
+        return
+    _score_pending = true
+    _score_wait = 0
+
+
+## Picks the scores up once Python has renamed the file into place.
+func _collect_scores() -> void:
+    if not FileAccess.file_exists(LIVE_OUT):
+        return
+    _score_pending = false
+    _scores.clear()
+    var g := FileAccess.open(LIVE_OUT, FileAccess.READ)
+    if g == null:
+        return
+    var parsed = JSON.parse_string(g.get_as_text())
+    g.close()
+    if typeof(parsed) != TYPE_DICTIONARY:
+        return
+    for row in parsed.get("scores", []):
+        var qid := String(row.get("quest_id", ""))
+        if row.has("error"):
+            _scores[qid] = String(row["error"])
+        elif row.get("score") == null:
+            _scores[qid] = _english_outcome(String(row.get("outcome", "-")))
+        else:
+            _scores[qid] = "%.2f/10 - %s" % [
+                float(row["score"]), _english_outcome(String(row.get("outcome", "")))]
+
+
+## st.py speaks French (it is an older tool, fully commented that way); this panel
+## does not. Translate the outcome tiers on the way in.
+##
+## Order matters: "REUSSITE CRITIQUE" has to be replaced before "REUSSITE", or the
+## longer label would be mangled into "CRITICAL SUCCESS CRITIQUE".
+## Statistic names as the GAME shows them, not as the engine names them. The wheel
+## reads FOR / AGI / CHA / MAG / INT / FRT, so "WITS" in our own panel had the player
+## looking for a stat that does not exist on screen.
+const STAT_LABEL := {
+    "STRENGTH": "FOR", "AGILITY": "AGI", "CHARISMA": "CHA",
+    "MAGIC": "MAG", "WITS": "INT", "LUCK": "FRT",
+}
+
+
+func _stat_label(name: String) -> String:
+    return String(STAT_LABEL.get(name, name))
+
+
+const OUTCOME_FR_EN := [
+    ["REUSSITE CRITIQUE", "CRITICAL SUCCESS"],
+    ["GRANDE REUSSITE", "GREAT SUCCESS"],
+    ["ECHEC CRITIQUE", "CRITICAL FAILURE"],
+    ["ECHEC MAJEUR", "MAJOR FAILURE"],
+    ["REUSSITE", "SUCCESS"],
+    ["ECHEC", "FAILURE"],
+    ["FORTUNE", "LUCK"],
+]
+
+
+func _english_outcome(text: String) -> String:
+    var out := text
+    for pair in OUTCOME_FR_EN:
+        out = out.replace(pair[0], pair[1])
+    return out
+
+
+# ------------------------------------------------------------ audience choices
+#
+# A choice that grants a quest carries its id (`related_quest_id`), so the quest
+# resource can be loaded and inspected before the choice is even made. We append the
+# unexpected outcomes AND the knights that trigger them to the button tooltip.
+#
+# Unlike the round-table read-out, this one names names: the player asked for it
+# explicitly, precisely to decide whether a quest is worth taking.
+
+func _update_choices() -> void:
+    for i in range(_choices.size() - 1, -1, -1):
+        var b: Node = _choices[i]
+        if not is_instance_valid(b):
+            _choices.remove_at(i)
+            continue
+        _annotate_choice(b)
+
+
+## ChoiceButton EXTENDS Button, so the option text is its own `text` property
+## (`dialogue_container.gd`: `choice_buttons[i].text = ... choices[i].text`).
+## Walking the subtree instead picked up the decorative hint labels, and the mod
+## kept asking the solver about "+", "-" and "->".
+func _choice_label(n: Node) -> String:
+    if not ("text" in n):
+        return ""
+    return String(n.text).strip_edges()
+
+
+## Asks st.py what each visible option grants.
+##
+## Runs the solver WITHOUT blocking. `OS.execute` froze the game for the whole
+## Python start-up on every new line of dialogue - the player saw a stutter before
+## each set of choices. We now spawn the process, and pick the answer up from the
+## output file on a later tick.
+func _refresh_rewards() -> void:
+    # An answer may be waiting from a previous tick.
+    if _choice_pending != "":
+        _choice_wait += 1
+        # A crashed or missing interpreter would otherwise leave us waiting forever,
+        # and no tooltip would ever be annotated again.
+        if _choice_wait > MAX_WAIT:
+            _log("st.py hints timed out")
+            _choice_sig = _choice_pending
+            _choice_pending = ""
+        else:
+            _collect_rewards()
+        return
+    var labels := []
+    for b in _choices:
+        if not is_instance_valid(b) or not b.is_visible_in_tree():
+            continue
+        var lab := _choice_label(b)
+        if lab != "" and not labels.has(lab):
+            labels.append(lab)
+    if labels.is_empty():
+        _choice_sig = ""
+        return
+    var sig := "|".join(PackedStringArray(labels))
+    if sig == _choice_sig:
+        return
+
+    # The cache belongs to ONE set of choices, not to the session. st.py resolves a
+    # label inside the knot that covers the whole set, so the same wording can mean
+    # something else in another audience - keeping it would show a stale reward.
+    _rewards.clear()
+    var ask := labels
+
+    if not _ensure_cache():
+        _choice_sig = sig
+        return
+    var f := FileAccess.open(HINTS_IN, FileAccess.WRITE)
+    if f == null:
+        return
+    f.store_string(JSON.stringify({"choices": ask}))
+    f.close()
+    # Remove the previous answer: its presence is the signal that the new one landed.
+    DirAccess.remove_absolute(ProjectSettings.globalize_path(HINTS_OUT))
+    var pid := OS.create_process(_solver_exe, _solver_argv(["hints",
+        "--in=" + ProjectSettings.globalize_path(HINTS_IN),
+        "--out=" + ProjectSettings.globalize_path(HINTS_OUT)]))
+    if pid <= 0:
+        _log("the audience lookup could not start")
+        _choice_sig = sig
+        return
+    _choice_pending = sig
+    _choice_wait = 0
+
+
+## Reads the answer once st.py has written it. The file is renamed into place by
+## Python, so its mere existence means it is complete.
+func _collect_rewards() -> void:
+    if not FileAccess.file_exists(HINTS_OUT):
+        return
+    var sig := _choice_pending
+    _choice_pending = ""
+    _choice_sig = sig
+    var g := FileAccess.open(HINTS_OUT, FileAccess.READ)
+    if g == null:
+        return
+    var parsed = JSON.parse_string(g.get_as_text())
+    g.close()
+    if typeof(parsed) != TYPE_DICTIONARY:
+        return
+    for row in parsed.get("hints", []):
+        var lines := PackedStringArray()
+        for e in row.get("equipment", []):
+            lines.append("Reward: %s (%s)" % [String(e.get("name", "?")),
+                                              String(e.get("kind", "?"))])
+        for q in row.get("quests", []):
+            lines.append("Unlocks quest: %s" % String(q.get("name", "?")))
+        # "" is a real answer: this option grants nothing, do not ask again.
+        _rewards[String(row.get("label", ""))] = "
+".join(lines)
+
+
+func _annotate_choice(b: Node) -> void:
+    var parts := PackedStringArray()
+    if settings.get("audience_rewards", false):
+        var reward: String = _rewards.get(_choice_label(b), "")
+        if reward != "":
+            parts.append(reward)
+    var qid := String(b.related_quest_id) if ("related_quest_id" in b) else ""
+    if settings.get("audience_rewards", false) and qid != "":
+        var loot := _quest_reward_lines(qid)
+        if loot != "":
+            parts.append(loot)
+    if settings.get("audience_outcomes", false) and qid != "":
+        var t := _choice_tooltip(qid)
+        if t != "":
+            parts.append(t)
+    var key0 := b.get_instance_id()
+    if parts.is_empty():
+        # Nothing to add for THIS choice. The buttons are a reused pool, so leaving
+        # our previous text in place made an old audience's tooltip haunt a new one
+        # ("Unlocks quest: ..." on a choice that unlocks nothing). Put the game's own
+        # tooltip back and forget the button.
+        var stale: Dictionary = _tips.get(key0, {})
+        if not stale.is_empty() and String(b.tooltip_text) == String(stale.get("full", "")):
+            b.tooltip_text = String(stale.get("base", ""))
+        _tips.erase(key0)
+        return
+    var extra := "
+".join(parts)
+    # Keep whatever the game already put there, and add ours below it once.
+    #
+    # Remembering the last tooltip we wrote is what tells our own text apart from the
+    # game's, without needing a visible marker: a "---" separator was showing on its
+    # own above our lines whenever the game had put no tooltip at all.
+    var key := key0
+    var base := String(b.tooltip_text)
+    var known: Dictionary = _tips.get(key, {})
+    if String(known.get("full", "")) == base:
+        base = String(known.get("base", ""))
+    var full := extra if base == "" else base + "
+---
+" + extra
+    b.tooltip_text = full
+    _tips[key] = {"base": base, "full": full}
+
+
+# ------------------------------------------------------------------- the kitchen
+#
+# The game already draws a green thumb on a dish, but only once the knight has been
+# served it: `slot.likes.visible = meal_ID in knight.known_liked_meals`. The full
+# list is right beside it in `get_liked_meals()`, so we light the same thumb on the
+# dishes he likes but has never been offered - the player asked for exactly the
+# indicator the game uses when it already knows.
+
+func _update_meal_likes() -> void:
+    if not is_instance_valid(_kitchen):
+        return
+    var knight = _kitchen._current_selected_knight
+    if not is_instance_valid(knight):
+        return
+    var shop = _kitchen.kitchen_shop
+    if not is_instance_valid(shop) or not is_instance_valid(shop.equipment_container):
+        return
+    # Disliked dishes are the other half of the same information: the game knows the
+    # full list, and hiding it only means serving a bad meal to find out. Anything a
+    # knight does not like is disliked - `liked_meals` is the whole of what he wants.
+    var liked: Array = knight.get_liked_meals()
+    for slot in shop.equipment_container.get_children():
+        if not ("equipment" in slot) or not ("likes" in slot):
+            continue
+        var item = slot.equipment
+        if not is_instance_valid(item) or not (item is Meal):
+            continue
+        var ok: bool = item.meal_ID in liked
+        if is_instance_valid(slot.likes) and ok:
+            slot.likes.visible = true
+        if is_instance_valid(slot.dislikes) and not ok:
+            slot.dislikes.visible = true
+
+
+## The quest card shows "Mount" with no name. Each chip is a RewardDisplay holding
+## its own `QuestReward`, so the item is one hop away - we just put it in the
+## tooltip. Reading the resource only; nothing is triggered.
+func _update_reward_chips() -> void:
+    for i in range(_rewards_shown.size() - 1, -1, -1):
+        var chip: Node = _rewards_shown[i]
+        if not is_instance_valid(chip):
+            _rewards_shown.remove_at(i)
+            continue
+        var text := _reward_name(chip.quest_reward)
+        if text == "":
+            continue
+        if chip.tooltip_text != text:
+            chip.tooltip_text = text
+            # A PanelContainer ignores the mouse by default, so no tooltip would ever
+            # show: it has to be told to catch it.
+            chip.mouse_filter = Control.MOUSE_FILTER_STOP
+        # The tooltip on its own was useless on the quest card: the chip sits under
+        # the audience popup, and moving the pointer onto it CLOSES that popup, so
+        # the player never gets to read it. RewardDisplay writes a generic
+        # "NEW_MOUNT" / "NEW_RELIC" into its label - we overwrite it with the real
+        # item name, which is the information the player actually wants.
+        #
+        # Nothing to restore when the setting is unticked: RewardDisplay rewrites the
+        # label from scratch every time a quest card is built.
+        var lab = chip.reward_label
+        if not is_instance_valid(lab):
+            continue
+        var want := _reward_item_name(chip.quest_reward)
+        if want != "" and String(lab.text) != want:
+            lab.text = want
+
+
+## The item's name alone, for the chip itself. The stats stay in the tooltip: the
+## chip is a few characters wide and the card lays them out in a FlowContainer.
+func _reward_item_name(r) -> String:
+    var item = _reward_item(r)
+    if not is_instance_valid(item):
+        return ""
+    return tr(item.name)
+
+
+## The relic / mount / consumable / quest item a reward hands over, null otherwise.
+func _reward_item(r):
+    if not is_instance_valid(r):
+        return null
+    match r.reward_type:
+        QuestReward.RewardType.RELIC:
+            return r.relic
+        QuestReward.RewardType.MOUNT:
+            return r.mount
+        QuestReward.RewardType.CONSUMABLE:
+            return r.consumable
+        QuestReward.RewardType.QUEST_ITEM:
+            return r.quest_item
+    return null
+
+
+## "Paul (mount, STR +1, CHA -2)" for a reward that hands over an item, "" otherwise.
+func _reward_name(r) -> String:
+    if not is_instance_valid(r):
+        return ""
+    var item = null
+    var kind := ""
+    match r.reward_type:
+        QuestReward.RewardType.RELIC:
+            item = r.relic
+            kind = "relic"
+        QuestReward.RewardType.MOUNT:
+            item = r.mount
+            kind = "mount"
+        QuestReward.RewardType.CONSUMABLE:
+            item = r.consumable
+            kind = "consumable"
+        QuestReward.RewardType.QUEST_ITEM:
+            item = r.quest_item
+            kind = "quest item"
+        _:
+            return ""
+    if not is_instance_valid(item):
+        return ""
+    var bits := PackedStringArray([kind])
+    for id in item.statistics_value:
+        var v: int = int(item.statistics_value[id])
+        if v != 0:
+            bits.append("%s %+d" % [_stat_label(Knight.Statistics.keys()[id]), v])
+    if item.bonus_armor != 0:
+        bits.append("armor %+d" % item.bonus_armor)
+    return "%s (%s)" % [tr(item.name), ", ".join(bits)]
+
+
+## Names the relic / mount / consumable a quest promises.
+##
+## The quest card shows a generic "Mount" icon and the game gives no way to hover it
+## - hovering closes the audience popup. The item is right there in the resource
+## though: `QuestReward` carries `relic` / `mount` / `consumable` / `quest_item`.
+##
+## Reads `success_rewards` only, which is plain exported data. Never call
+## `determine_rewards()`: it FIRES the rewards.
+func _quest_reward_lines(qid: String) -> String:
+    var quest = GameState.quests_manager.get_quest_from_id(qid)
+    if quest == null:
+        return ""
+    var lines := PackedStringArray()
+    for r in quest.success_rewards:
+        if not is_instance_valid(r):
+            continue
+        var item = null
+        var kind := ""
+        match r.reward_type:
+            QuestReward.RewardType.RELIC:
+                item = r.relic
+                kind = "relic"
+            QuestReward.RewardType.MOUNT:
+                item = r.mount
+                kind = "mount"
+            QuestReward.RewardType.CONSUMABLE:
+                item = r.consumable
+                kind = "consumable"
+            QuestReward.RewardType.QUEST_ITEM:
+                item = r.quest_item
+                kind = "quest item"
+            _:
+                continue
+        if is_instance_valid(item):
+            lines.append("Reward: %s (%s)" % [tr(item.name), kind])
+    return "
+".join(lines)
+
+
+func _choice_tooltip(qid: String) -> String:
+    var quest = GameState.quests_manager.get_quest_from_id(qid)
+    if quest == null:
+        return ""
+    var outcomes: Array = quest.special_outcomes
+    if outcomes.is_empty():
+        return "No unexpected outcome."
+    # One line per outcome, no header and no count: the quest name and duration are
+    # already on the card the player is looking at.
+    var lines := PackedStringArray()
+    for special in outcomes:
+        if not is_instance_valid(special):
+            continue
+        _add_once(lines, "Unexpected outcome: %s" % _outcome_condition(special))
+    return "
+".join(lines)
+
+
+## Appends a line unless it is already there.
+##
+## A quest can carry SEVERAL special outcomes sharing the same trigger - Villador's
+## false coins has two, both keyed on the same knight, the game picking between them
+## on story state the player cannot see. Listing both printed the very same sentence
+## twice. Only IDENTICAL lines collapse: two outcomes with different requirements
+## still get a line each.
+func _add_once(lines: PackedStringArray, line: String) -> void:
+    if not lines.has(line):
+        lines.append(line)
+
+
+## What it takes to trigger an unexpected outcome, in the shortest readable form.
+## Named knights first, then a required trait, then a statistic threshold.
+func _outcome_condition(special) -> String:
+    var who := PackedStringArray()
+    for k in special.knights:
+        if is_instance_valid(k):
+            who.append(tr(k.name))
+    if who.size() > 0:
+        return ", ".join(who)
+    if special.required_knight_characteristics.size() > 0:
+        var traits := PackedStringArray()
+        for t in special.required_knight_characteristics:
+            traits.append(TagManager.CharacterTags.keys()[t])
+        return "trait " + ", ".join(traits)
+    if special.amount > 0:
+        return "%s %s %d" % [_stat_label(Knight.Statistics.keys()[special.stat]),
+            (">=" if special.requires_higher else "<="), special.amount]
+    return "unknown conditions"
+
+
+# ---------------------------------------------------------- unexpected outcomes
+#
+# A quest can hide an unexpected outcome: a special ending that fires when the
+# assigned team meets certain conditions (a specific knight, a trait, a statistic
+# above a threshold).
+#
+# That is what explains a plan sending ONE knight on a quest meant for two or three:
+# the unexpected outcome beats a plain success.
+#
+# We read `quest.special_outcomes` and call `are_conditions_met()`, which is a PURE
+# function (reads only). Not to be confused with `quest.determine_outcome()`, which
+# FREEZES the outcome and triggers damage and rewards: calling it for a preview
+# would lock in the quest result before the player confirms.
+#
+# We announce the fact, never the recipe: conditions sometimes hinge on traits the
+# player has not discovered yet.
+
+func _outcomes_of(quest) -> Array:
+    var list: Array = []
+    if not is_instance_valid(quest):
+        return list
+    list.append_array(quest.special_outcomes)
+    if is_instance_valid(quest.selected_modifier):
+        list.append_array(quest.selected_modifier.unexpected_outcomes)
+    return list
+
+
+func _update_outcome() -> void:
+    if not is_instance_valid(_outcome_label):
+        return
+    if not is_instance_valid(_section):
+        _outcome_label.text = ""
+        return
+    _outcome_label.text = _outcome_text(_section.selected_quest)
+
+
+## Will the team on this quest trigger a special outcome as it stands?
+func _outcome_triggered(quest) -> bool:
+    if not is_instance_valid(quest):
+        return false
+    for special in _outcomes_of(quest):
+        if is_instance_valid(special) and special.are_conditions_met(quest.assigned_knights):
+            return true
+    return false
+
+
+func _outcome_text(quest) -> String:
+    var list := _outcomes_of(quest)
+    if list.is_empty():
+        return "Unexpected outcome: none on this quest"
+    # The player asked for the condition itself, not just a count: "possible,
+    # conditions not met (1)" told them nothing they could act on.
+    var lines := PackedStringArray()
+    for special in list:
+        if not is_instance_valid(special):
+            continue
+        if special.are_conditions_met(quest.assigned_knights):
+            _add_once(lines, "Unexpected outcome: TRIGGERED by the current team")
+        else:
+            _add_once(lines, "Unexpected outcome: needs %s" % _outcome_condition(special))
+    return "
+".join(lines)
+
+
+# ------------------------------------------------------------------ test bench
+
+func _start_bench() -> void:
+    var t := Timer.new()
+    t.wait_time = 0.25
+    t.autostart = true
+    t.timeout.connect(_read_command)
+    add_child(t)
+
+
+func _read_command() -> void:
+    if not settings.get("test_bench", false):
+        return
+    if not FileAccess.file_exists(CMD_PATH):
+        return
+    var f := FileAccess.open(CMD_PATH, FileAccess.READ)
+    if f == null:
+        return
+    var name := f.get_as_text().strip_edges()
+    f.close()
+    DirAccess.remove_absolute(ProjectSettings.globalize_path(CMD_PATH))
+    var reply := ""
+    if not COMMANDS.has(name):
+        reply = "unknown command: %s\nknown: %s" % [name, ", ".join(COMMANDS)]
+    else:
+        reply = _run_command(name)
+    var o := FileAccess.open(OUT_PATH, FileAccess.WRITE)
+    if o != null:
+        o.store_string(reply)
+        o.close()
+
+
+func _run_command(name: String) -> String:
+    match name:
+        "scene":
+            var sc := get_tree().current_scene
+            return "scene: %s\nsection: %s\nroundtable: %s" % [
+                ("(none)" if sc == null else sc.name),
+                ("absent" if not is_instance_valid(_section) else "present"),
+                ("absent" if not is_instance_valid(_roundtable) else "present")]
+        "assign":
+            _on_pressed()
+            return "\"Ideal assignment\" pressed\n" + _last_report
+        "clear":
+            _on_clear_pressed()
+            return "\"Clear all\" pressed\n" + _last_report
+        "load":
+            if not is_instance_valid(_home):
+                return "main menu absent (already in game?)"
+            _home._on_slot_to_resume_selected(0)
+            return "loading started from %s (%s)" % [
+                _home.name, String(_home.get_script().resource_path)]
+        "table":
+            if not is_instance_valid(_tower):
+                return "tower view absent"
+            _tower._open_roundtable_container()
+            return "round table opening started"
+        "tree":
+            return _dump_tree()
+        "wheel":
+            return _dump_wheel()
+        "outcomes":
+            return _dump_outcomes()
+        "scores":
+            return _dump_scores()
+        "options":
+            if not is_instance_valid(_options_panel):
+                return "options screen not built"
+            if _options_panel.visible:
+                _close_options()
+            else:
+                _open_options()
+            return "options screen: %s" % ("visible" if _options_panel.visible else "hidden")
+        "options_state":
+            return _dump_options_state()
+        "choices":
+            return _dump_choices()
+        "test_choice":
+            return _choice_tooltip("contract_almora_new_ramparts_building")
+        "test_outcome":
+            return _test_outcome()
+        "test_lock":
+            return _test_lock()
+        "test_required":
+            return _test_required()
+        "achievements":
+            return _dump_achievements()
+        "clean_achievements":
+            return _clean_achievements()
+        "state":
+            return _dump_state()
+        "quests":
+            return _dump_quests()
+        "knights":
+            return _dump_knights()
+    return "not implemented: " + name
+
+
+## Audience choice buttons currently on screen, with what we appended to them.
+func _dump_choices() -> String:
+    if _choices.is_empty():
+        return "no choice button on screen (not in an audience?)"
+    var out := PackedStringArray()
+    for b in _choices:
+        if not is_instance_valid(b):
+            continue
+        var qid := String(b.related_quest_id) if ("related_quest_id" in b) else "-"
+        out.append("--- %s | quest: %s ---" % [b.name, ("(none)" if qid == "" else qid)])
+        out.append(String(b.tooltip_text))
+    return "
+".join(out)
+
+
+func _dump_options_state() -> String:
+    var lines := PackedStringArray()
+    lines.append("screen visible: %s" % (
+        "yes" if is_instance_valid(_options_panel) and _options_panel.visible else "no"))
+    for pair in OPTIONS:
+        lines.append("  %-24s %s" % [pair[0], settings.get(pair[0], false)])
+    return "\n".join(lines)
+
+
+## Real board state, as the game sees it. This is the reference used to check that
+## an application did what it claimed.
+func _dump_state() -> String:
+    var out := PackedStringArray()
+    for q in GameState.quests_manager.current_quests:
+        if not is_instance_valid(q):
+            continue
+        var names := PackedStringArray()
+        for k in q.assigned_knights:
+            if is_instance_valid(k):
+                var required := " (REQUIRED)" if k in q.requested_knights else ""
+                names.append(String(k.character_ink_id) + required)
+        if names.size() > 0:
+            out.append("%s: %s" % [String(q.quest_id), ", ".join(names)])
+    if out.size() == 0:
+        out.append("no assignment")
+    out.append("--- equipment worn ---")
+    for kn in GameState.character_manager.roundtable_knights:
+        if not is_instance_valid(kn):
+            continue
+        var items := PackedStringArray()
+        for eq in kn.equipments:
+            if is_instance_valid(eq):
+                items.append(String(eq.name) + (" [LOCKED]" if eq.is_exclusive else ""))
+        out.append("%s: %s" % [String(kn.character_ink_id),
+                               ("nothing" if items.size() == 0 else ", ".join(items))])
+    return "\n".join(out)
+
+
+## Exercises detection on a quest that really owns an unexpected outcome.
+##
+## The tuning save offers none, so we load the resource from disk and query its
+## conditions. Read-only: the quest is never added to the game, nothing is modified.
+func _test_outcome() -> String:
+    var path := "res://content/quests/contract_almora_new_ramparts_building.tres"
+    var quest = load(path)
+    if quest == null:
+        return "test quest not found: " + path
+    var out := PackedStringArray()
+    out.append("quest: %s (%d slot(s))" % [String(quest.quest_id), quest.nb_requested_knights])
+    out.append("declared outcomes: %d" % quest.special_outcomes.size())
+
+    var empty: Array[Knight] = []
+    for special in quest.special_outcomes:
+        if not is_instance_valid(special):
+            continue
+        out.append("  named knights: %d | required traits: %d | stat %s %s %d" % [
+            special.knights.size(), special.required_knight_characteristics.size(),
+            Knight.Statistics.keys()[special.stat],
+            (">=" if special.requires_higher else "<="), special.amount])
+        out.append("  conditions with an empty team: %s" % str(special.are_conditions_met(empty)))
+        for kn in GameState.character_manager.roundtable_knights:
+            if not is_instance_valid(kn):
+                continue
+            var solo: Array[Knight] = [kn]
+            out.append("  with %s alone: %s" % [String(kn.character_ink_id),
+                                                str(special.are_conditions_met(solo))])
+        # Positive path: replay the condition with exactly the knights it demands.
+        # Without this check, a detector that always says false would look healthy.
+        var wanted := PackedStringArray()
+        var ideal_team: Array[Knight] = []
+        for k in special.knights:
+            if is_instance_valid(k):
+                wanted.append(String(k.character_ink_id))
+                ideal_team.append(k)
+        out.append("  knight(s) demanded: %s" % (
+            "none" if wanted.size() == 0 else ", ".join(wanted)))
+        out.append("  with the demanded team: %s" % str(
+            special.are_conditions_met(ideal_team)))
+    return "\n".join(out)
+
+
+## Live scores, exactly as the panel shows them.
+func _dump_scores() -> String:
+    if not settings.get("live_score", false):
+        return "live_score setting is false"
+    _signature = ""          # force a recomputation
+    _update_score()
+    if _scores.is_empty():
+        return "no score (no knight assigned?)"
+    var out := PackedStringArray()
+    for qid in _scores:
+        out.append("%-46s %s" % [qid, _scores[qid]])
+    return "\n".join(out)
+
+
+## Unexpected outcome of every live quest, with the team assigned to it.
+func _dump_outcomes() -> String:
+    var out := PackedStringArray()
+    for q in GameState.quests_manager.current_quests:
+        if not is_instance_valid(q):
+            continue
+        var list := _outcomes_of(q)
+        var team := PackedStringArray()
+        for k in q.assigned_knights:
+            if is_instance_valid(k):
+                team.append(String(k.character_ink_id))
+        out.append("%-46s %d outcome(s) | team: %s" % [
+            String(q.quest_id), list.size(),
+            ("nobody" if team.size() == 0 else ", ".join(team))])
+        out.append("    -> %s" % _outcome_text(q))
+    return ("no quest" if out.size() == 0 else "\n".join(out))
+
+
+## Reports what the mod actually placed on the difficulty wheels.
+func _dump_wheel() -> String:
+    if not settings.get("wheel_numbers", false):
+        return "wheel_numbers setting is false"
+    if _wheels.size() == 0:
+        return "no wheel spotted (is the round table open?)"
+    var out := PackedStringArray()
+    for w in _wheels:
+        if not is_instance_valid(w):
+            continue
+        var q = w.current_quest
+        out.append("--- wheel: quest %s ---" % (
+            "(none)" if not is_instance_valid(q) else String(q.quest_id)))
+        if w.portions == null:
+            out.append("  no slices")
+            continue
+        for slice in w.portions.get_children():
+            if not ("statistic_id" in slice):
+                continue
+            var stat_name: String = Knight.Statistics.keys()[slice.statistic_id]
+            var lab: Label = slice.get_node_or_null(LABEL_NAME)
+            var placed := "(no label)"
+            if lab != null:
+                placed = ("hidden" if not lab.visible else "\"%s\"" % lab.text)
+            var diff: String = DifficultyHint.Difficulties.keys()[slice.difficulty]
+            var turned := "%.0f deg" % rad_to_deg(lab.rotation) if lab != null else "-"
+            out.append("  %-10s difficulty=%-8s visible=%-5s placed=%-8s rotation=%s" % [
+                stat_name, diff, str(slice.visible), placed, turned])
+    return "\n".join(out)
+
+
+## Checks that "Clear all" spares a locked item.
+##
+## Lends Ari's griffin (is_exclusive) to whichever knight comes first, runs the
+## global strip, verifies the item is still worn, then puts everything back.
+## No recruitment, no gold change: nothing that could fire a Steam achievement -
+## achievement_manager listens to no equipment signal.
+func _test_lock() -> String:
+    var cm = GameState.character_manager
+    if cm.roundtable_knights.size() == 0:
+        return "round table empty: load a save first"
+    var knight = cm.roundtable_knights[0]
+    var griffin = load("res://content/equipment/mounts/ari_griffin.tres")
+    if griffin == null:
+        return "griffin not found"
+    if not griffin.is_exclusive:
+        return "WARNING: this griffin is not flagged is_exclusive, test is meaningless"
+
+    var mount_before = knight.mount
+    knight.mount = griffin
+    var out := PackedStringArray()
+    out.append("lent to %s: %s (exclusive)" % [String(knight.character_ink_id),
+                                               String(griffin.name)])
+
+    var returned := _unequip_all()
+    var held: bool = knight.mount == griffin
+    out.append("global strip: %d item(s) returned" % returned)
+    out.append("VERDICT: %s" % ("lock holds, griffin still worn" if held
+                                else "FAILED - the griffin was torn off"))
+
+    knight.mount = mount_before
+    out.append("original state restored (mount: %s)" % (
+        "none" if not is_instance_valid(mount_before) else String(mount_before.name)))
+    return "\n".join(out)
+
+
+## Checks that "Clear all" spares a knight REQUIRED by the quest.
+##
+## Temporarily marks a knight as required, runs the global clear and verifies they
+## stayed in place, then undoes the marking.
+func _test_required() -> String:
+    var cm = GameState.character_manager
+    if cm.roundtable_knights.size() == 0:
+        return "round table empty: load a save first"
+    var quest = null
+    for q in GameState.quests_manager.current_quests:
+        if is_instance_valid(q):
+            quest = q
+            break
+    if quest == null:
+        return "no quest available"
+
+    var knight = cm.roundtable_knights[0]
+    var out := PackedStringArray()
+
+    _section.update_quests_panel(quest, false)
+    _section.assign_knight_to_quest(knight)
+    quest.requested_knights.append(knight)
+    out.append("%s marked REQUIRED on %s" % [String(knight.character_ink_id),
+                                             String(quest.quest_id)])
+
+    var removed := _clear_assignments()
+    var held: bool = knight in quest.assigned_knights
+    out.append("global clear: %d knight(s) removed" % removed)
+    out.append("VERDICT: %s" % ("lock holds, required knight stayed" if held
+                                else "FAILED - the required knight was torn off"))
+
+    quest.requested_knights.erase(knight)
+    if knight in quest.assigned_knights:
+        _section._unassign_knight_from_quest(knight)
+    out.append("marking undone, board reset")
+    return "\n".join(out)
+
+
+## Lists unlocked Steam achievements with their date. The timestamp is what tells
+## the ones earned by playing from the ones fired by mistake.
+func _dump_achievements() -> String:
+    if not Steam.isSteamRunning():
+        return "Steam is not running"
+    var out := PackedStringArray()
+    for key in CurrentPlatformManager.achievements_steam_name:
+        var name: String = String(CurrentPlatformManager.achievements_steam_name[key])
+        var d: Dictionary = Steam.getAchievementAndUnlockTime(name)
+        if not bool(d.get("achieved", false)):
+            continue
+        var t: int = int(d.get("unlocked", 0))
+        out.append("%-34s %s" % [name,
+            ("unknown date" if t == 0 else Time.get_datetime_string_from_unix_time(t, true))])
+    if out.size() == 0:
+        return "no achievement unlocked"
+    return "%d achievement(s) unlocked:\n%s" % [out.size(), "\n".join(out)]
+
+
+## Clears achievements fired by mistake. Touches ONLY the named list.
+func _clean_achievements() -> String:
+    if not Steam.isSteamRunning():
+        return "Steam is not running - cannot write"
+    var out := PackedStringArray()
+    for name in ACHIEVEMENTS_TO_CLEAR:
+        var before: Dictionary = Steam.getAchievementAndUnlockTime(name)
+        if not bool(before.get("achieved", false)):
+            out.append("%s: already absent, nothing done" % name)
+            continue
+        Steam.clearAchievement(name)
+        out.append("%s: cleared" % name)
+    Steam.storeStats()
+    out.append("--- verification ---")
+    for name in ACHIEVEMENTS_TO_CLEAR:
+        var after: Dictionary = Steam.getAchievementAndUnlockTime(name)
+        out.append("%s: %s" % [name,
+            ("STILL PRESENT" if bool(after.get("achieved", false)) else "removed")])
+    return "\n".join(out)
+
+
+## Lists script-bearing nodes: used to find a screen's real file name when suffix
+## detection fails.
+func _dump_tree() -> String:
+    var root := get_tree().current_scene
+    if root == null:
+        return "no current scene"
+    var out := PackedStringArray()
+    _walk(root, 0, out)
+    return "scene: %s\n%s" % [root.name, "\n".join(out)]
+
+
+func _walk(n: Node, depth: int, out: PackedStringArray) -> void:
+    if depth > 8 or out.size() > 200:
+        return
+    var s = n.get_script()
+    if s != null:
+        out.append("%s%s  <- %s" % ["  ".repeat(depth), n.name,
+                                    String(s.resource_path).get_file()])
+    for c in n.get_children():
+        _walk(c, depth + 1, out)
+
+
+func _dump_quests() -> String:
+    var out := PackedStringArray()
+    for q in GameState.quests_manager.current_quests:
+        if is_instance_valid(q):
+            out.append("%s (slots: %d)" % [String(q.quest_id), q.nb_requested_knights])
+    return ("no quest" if out.size() == 0 else "\n".join(out))
+
+
+func _dump_knights() -> String:
+    var out := PackedStringArray()
+    for kn in GameState.character_manager.roundtable_knights:
+        if is_instance_valid(kn):
+            out.append("%s (quest: %s)" % [String(kn.character_ink_id),
+                ("none" if not is_instance_valid(kn.assigned_quest)
+                 else String(kn.assigned_quest.quest_id))])
+    return ("round table empty" if out.size() == 0 else "\n".join(out))
+
+
+# ------------------------------------------------------------------ settings
+
+func _load_settings() -> void:
+    settings = DEFAULTS.duplicate(true)
+    var abs_dir := ProjectSettings.globalize_path(MOD_DIR)
+    if not DirAccess.dir_exists_absolute(abs_dir):
+        DirAccess.make_dir_recursive_absolute(abs_dir)
+    if not FileAccess.file_exists(SETTINGS_PATH):
+        _save_settings()
+        return
+    var f := FileAccess.open(SETTINGS_PATH, FileAccess.READ)
+    if f == null:
+        return
+    var parsed = JSON.parse_string(f.get_as_text())
+    f.close()
+    if typeof(parsed) != TYPE_DICTIONARY:
+        _log("settings.json unreadable, falling back to defaults")
+        return
+    # Merge: a key introduced by a later version of the mod keeps its default
+    # instead of disappearing.
+    for k in parsed:
+        settings[k] = parsed[k]
+    _save_settings()
+
+
+func _save_settings() -> void:
+    var f := FileAccess.open(SETTINGS_PATH, FileAccess.WRITE)
+    if f == null:
+        return
+    f.store_string(JSON.stringify(settings, "  "))
+    f.close()
+
+
+# ------------------------------------------------------------------------- UI
+#
+# The panel sits in its own CanvasLayer, over the game. It is deliberately opaque
+# with a bright border: on the round table background, a plain default panel was
+# hard to pick out.
+
+# Alpha kept fairly low: the panel sits over the round table, and the player asked
+# to keep seeing the scene through it. The text stays readable because the
+# background is very dark and the labels are near-white.
+# The in-game panel sits over the round table and the player wants to keep seeing
+# the scene through it. Readable anyway: very dark ground, near-white text.
+const PANEL_BG := Color(0.07, 0.09, 0.12, 0.32)
+# The options screen is a modal over a dimmed backdrop - it stays solid.
+const DIALOG_BG := Color(0.07, 0.09, 0.12, 0.97)
+const ACCENT := Color(0.96, 0.78, 0.35)
+
+
+func _framed_box(bg: Color, border: int, border_color: Color) -> StyleBoxFlat:
+    var sb := StyleBoxFlat.new()
+    sb.bg_color = bg
+    sb.set_border_width_all(border)
+    sb.border_color = border_color
+    sb.set_corner_radius_all(6)
+    sb.set_content_margin_all(10)
+    return sb
+
+
+func _style_button(b: Button, font_size: int) -> void:
+    b.add_theme_font_size_override("font_size", font_size)
+    b.add_theme_color_override("font_color", Color(1, 1, 1))
+    b.add_theme_color_override("font_hover_color", ACCENT)
+    b.add_theme_stylebox_override("normal", _framed_box(Color(0.13, 0.16, 0.21, 0.50), 2, ACCENT))
+    b.add_theme_stylebox_override("hover", _framed_box(Color(0.22, 0.27, 0.34, 0.60), 2, Color(1, 1, 1)))
+    b.add_theme_stylebox_override("pressed", _framed_box(Color(0.30, 0.36, 0.44, 0.70), 2, Color(1, 1, 1)))
+    b.add_theme_stylebox_override("disabled", _framed_box(Color(0.13, 0.16, 0.21, 0.30), 2, Color(0.5, 0.5, 0.5)))
+
+
+# The panel can be dragged by its top bar and resized by the bottom-right grip.
+# Position and size are stored in settings.json, so they survive a restart.
+const MIN_PANEL := Vector2(230, 120)
+
+var _dragging := false
+var _resizing := false
+var _grab_offset := Vector2.ZERO
+var _edge := Vector2i.ZERO      # which border is being dragged, -1/0/1 per axis
+var _box: VBoxContainer         # panel contents, measured to auto-fit the height
+
+
+func _build_ui() -> void:
+    _layer = CanvasLayer.new()
+    _layer.layer = 100
+    _layer.name = "SovereignModLayer"
+    add_child(_layer)
+
+    # A plain Panel, not a PanelContainer: the latter stretches EVERY child to its
+    # own size, which would blow the resize grip up to cover the whole panel.
+    _panel = Panel.new()
+    # Free-floating: anchored top-left and driven by position/size, otherwise the
+    # anchors would fight the drag.
+    _panel.set_anchors_preset(Control.PRESET_TOP_LEFT)
+    _panel.position = _stored_vector("panel_position", Vector2(-1, -1))
+    _panel.size = _stored_vector("panel_size", MIN_PANEL)
+    _panel.visible = false
+    _panel.add_theme_stylebox_override("panel", _framed_box(PANEL_BG, 2, ACCENT))
+    _panel.mouse_default_cursor_shape = Control.CURSOR_MOVE
+    _panel.gui_input.connect(_on_panel_drag_input)
+    _layer.add_child(_panel)
+
+    var margin := MarginContainer.new()
+    margin.set_anchors_preset(Control.PRESET_FULL_RECT)
+    # Wider than EDGE, so the resize band along the border is never covered by a
+    # button that would swallow the click first.
+    for side in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
+        margin.add_theme_constant_override(side, 14)
+    margin.mouse_filter = Control.MOUSE_FILTER_IGNORE
+    _panel.add_child(margin)
+
+    var box := VBoxContainer.new()
+    box.add_theme_constant_override("separation", 6)
+    box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+    margin.add_child(box)
+    _box = box
+
+    _button = Button.new()
+    _button.text = "Ideal assignment"
+    _button.custom_minimum_size = Vector2(0, 52)
+    _style_button(_button, 22)
+    _button.pressed.connect(_on_pressed)
+    box.add_child(_button)
+
+    _clear_button = Button.new()
+    _clear_button.text = "Clear all"
+    _clear_button.custom_minimum_size = Vector2(0, 44)
+    _style_button(_clear_button, 18)
+    _clear_button.pressed.connect(_on_clear_pressed)
+    box.add_child(_clear_button)
+
+    # Score first: it is the number the player is actually after. The advice below
+    # is context, not the headline.
+    # The score alone did not say WHICH quest it scored - the panel sits far from the
+    # card. Name and figure form one block, so no rule between them.
+    _quest_label = _panel_label(box, 17, ACCENT)
+    _quest_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+    _score_label = _panel_label(box, 20, ACCENT)
+    _score_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+    # Order asked for by the player: the score, then what could go unexpectedly, then
+    # the advice that costs gold and lives in another room.
+    _score_sep = _panel_rule(box)
+    _outcome_label = _panel_label(box, 15, Color(0.85, 0.85, 0.85))
+    # One label per topic instead of one block of text: that is what lets a thin rule
+    # sit between them, and lets an empty topic disappear with its rule.
+    _meal_sep = _panel_rule(box)
+    _meal_label = _panel_label(box, 15, Color(0.85, 0.85, 0.85))
+    _levels_sep = _panel_rule(box)
+    _levels_label = _panel_label(box, 15, Color(0.85, 0.85, 0.85))
+    _buy_sep = _panel_rule(box)
+    _advice_label = _panel_label(box, 15, Color(0.85, 0.85, 0.85))
+    _status = _panel_label(box, 15, Color(1.0, 0.55, 0.45))
+
+    # No widget for either action: grab an edge or a corner to resize, grab anywhere
+    # else to move. Buttons consume their own clicks first, and labels let them
+    # through (Label defaults to MOUSE_FILTER_IGNORE).
+
+
+## A faint rule between two sections of the panel.
+func _panel_rule(parent: Node) -> HSeparator:
+    var sep := HSeparator.new()
+    var line := StyleBoxLine.new()
+    line.color = Color(1, 1, 1, 0.16)
+    line.thickness = 1
+    sep.add_theme_stylebox_override("separator", line)
+    # 2 px, not the default: the rule's own height stacks with the box separation
+    # above AND below it, so a generous value here reads as a big empty band.
+    sep.add_theme_constant_override("separation", 2)
+    sep.mouse_filter = Control.MOUSE_FILTER_IGNORE
+    parent.add_child(sep)
+    return sep
+
+
+func _panel_label(parent: Node, font_size: int, color: Color) -> Label:
+    var lab := Label.new()
+    lab.text = ""
+    lab.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+    lab.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    lab.add_theme_font_size_override("font_size", font_size)
+    lab.add_theme_color_override("font_color", color)
+    parent.add_child(lab)
+    return lab
+
+
+## Reads a Vector2 back from settings; falls back when absent or malformed.
+func _stored_vector(key: String, fallback: Vector2) -> Vector2:
+    var v = settings.get(key)
+    if typeof(v) == TYPE_ARRAY and v.size() == 2:
+        return Vector2(float(v[0]), float(v[1]))
+    return fallback
+
+
+func _store_geometry() -> void:
+    settings["panel_position"] = [_panel.position.x, _panel.position.y]
+    settings["panel_size"] = [_panel.size.x, _panel.size.y]
+    _save_settings()
+
+
+## Grabbing the panel: a left or right edge resizes the width, anywhere else moves.
+## The height is not draggable - it follows the content through _fit_height().
+const EDGE := 12.0
+
+func _edge_at(local: Vector2) -> Vector2i:
+    var ex := 0
+    if local.x <= EDGE:
+        ex = -1
+    elif local.x >= _panel.size.x - EDGE:
+        ex = 1
+    # No vertical handle on purpose: the height follows the content by itself
+    # (_fit_height), so dragging it would only fight the auto-fit.
+    return Vector2i(ex, 0)
+
+
+func _cursor_for(edge: Vector2i) -> int:
+    return Control.CURSOR_MOVE if edge.x == 0 else Control.CURSOR_HSIZE
+
+
+func _on_panel_drag_input(event: InputEvent) -> void:
+    if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
+        if event.pressed:
+            _edge = _edge_at(event.position)
+            _dragging = _edge == Vector2i.ZERO
+            _resizing = not _dragging
+            _grab_offset = _panel.position - _panel.get_global_mouse_position()
+        else:
+            if _dragging or _resizing:
+                _store_geometry()
+            _dragging = false
+            _resizing = false
+    elif event is InputEventMouseMotion:
+        if _dragging:
+            _panel.position = _panel.get_global_mouse_position() + _grab_offset
+            _keep_on_screen()
+        elif _resizing:
+            _resize_to(_panel.get_global_mouse_position())
+        else:
+            # Hovering: show which action the current spot would trigger.
+            _panel.mouse_default_cursor_shape = _cursor_for(_edge_at(event.position))
+
+
+## Moves the caught edge to the mouse, keeping the opposite one anchored.
+func _resize_to(mouse: Vector2) -> void:
+    var left := _panel.position.x
+    var top := _panel.position.y
+    var right := left + _panel.size.x
+    var bottom := top + _panel.size.y
+
+    if _edge.x == 1:
+        right = max(mouse.x, left + MIN_PANEL.x)
+    elif _edge.x == -1:
+        left = min(mouse.x, right - MIN_PANEL.x)
+    _panel.position = Vector2(left, top)
+    _panel.size.x = right - left
+
+
+## Shrinks the panel to what it actually shows.
+##
+## The content varies a lot: with nothing to buy it is three lines, with a full
+## shopping list it is eight. A fixed height left a large empty band under the last
+## line, which is what the player flagged.
+func _fit_height() -> void:
+    if not is_instance_valid(_box):
+        return
+    var wanted: float = _box.get_combined_minimum_size().y + 28.0   # 2 x 14 px margin
+    if absf(_panel.size.y - wanted) > 1.0:
+        _panel.size.y = wanted
+
+
+## Keeps a sliver of the panel reachable: dragged fully off-screen, it could never
+## be grabbed again, and the only way back would be editing settings.json by hand.
+func _keep_on_screen() -> void:
+    var screen := _panel.get_viewport_rect().size
+    _panel.position.x = clamp(_panel.position.x, 40.0 - _panel.size.x, screen.x - 60.0)
+    _panel.position.y = clamp(_panel.position.y, 0.0, screen.y - 40.0)
+
+
+# ---------------------------------------------------------------- options screen
+#
+# Opened on demand: from the "Mod options" button on the game's home screen, or
+# with F9 at any time. It used to pop up by itself on startup, which the player
+# found intrusive - a screen you did not ask for is in the way.
+#
+# Boxes act AT ONCE: every feature re-reads its setting at run time, so nothing
+# needs a restart.
+
+var _options_layer: CanvasLayer
+var _options_panel: Control
+var _options_button: Button
+
+
+func _build_options() -> void:
+    _options_layer = CanvasLayer.new()
+    _options_layer.layer = 200
+    _options_layer.name = "SovereignModOptions"
+    add_child(_options_layer)
+
+    # Entry point on the game's home screen. Shown only while the main menu is up,
+    # so it never sits on top of the game itself.
+    # Anchored to the bottom CENTRE, next to the mail and Discord icons, so it keeps
+    # its place next to them whatever the window size - a corner offset in pixels
+    # would drift away on another resolution.
+    _options_button = Button.new()
+    _options_button.text = "Mod options"
+    _options_button.custom_minimum_size = Vector2(200, 44)
+    _options_button.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
+    _options_button.grow_horizontal = Control.GROW_DIRECTION_BOTH
+    _options_button.grow_vertical = Control.GROW_DIRECTION_BEGIN
+    _style_button(_options_button, 17)
+    _options_button.pressed.connect(_open_options)
+    _options_button.visible = false
+    _options_layer.add_child(_options_button)
+
+    # Backdrop that swallows the mouse: without it clicks fall through to the game.
+    var backdrop := ColorRect.new()
+    backdrop.color = Color(0, 0, 0, 0.6)
+    backdrop.set_anchors_preset(Control.PRESET_FULL_RECT)
+    backdrop.mouse_filter = Control.MOUSE_FILTER_STOP
+    _options_layer.add_child(backdrop)
+    _options_panel = backdrop
+    _options_panel.visible = false
+
+    var frame := PanelContainer.new()
+    frame.set_anchors_preset(Control.PRESET_CENTER)
+    frame.grow_horizontal = Control.GROW_DIRECTION_BOTH
+    frame.grow_vertical = Control.GROW_DIRECTION_BOTH
+    frame.add_theme_stylebox_override("panel", _framed_box(DIALOG_BG, 2, ACCENT))
+    backdrop.add_child(frame)
+
+    var margin := MarginContainer.new()
+    for side in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
+        margin.add_theme_constant_override(side, 26)
+    frame.add_child(margin)
+
+    var box := VBoxContainer.new()
+    box.add_theme_constant_override("separation", 12)
+    box.custom_minimum_size = Vector2(620, 0)
+    margin.add_child(box)
+
+    var title := Label.new()
+    title.text = "Sovereign QoL mod"
+    title.add_theme_font_size_override("font_size", 26)
+    title.add_theme_color_override("font_color", ACCENT)
+    box.add_child(title)
+
+    box.add_child(HSeparator.new())
+
+    for pair in OPTIONS:
+        box.add_child(_option_box(String(pair[0]), String(pair[1]), 22))
+
+    box.add_child(HSeparator.new())
+
+    var close := Button.new()
+    close.text = "Validate"
+    close.custom_minimum_size = Vector2(0, 52)
+    _style_button(close, 22)
+    close.pressed.connect(_close_options)
+    box.add_child(close)
+
+
+## A checkbox bound to a setting key. `icon_max_width` is what actually enlarges the
+## tick mark: raising the font size alone leaves a tiny box next to big text.
+func _option_box(key: String, label: String, font_size: int) -> CheckBox:
+    var cb := CheckBox.new()
+    cb.text = label
+    cb.button_pressed = bool(settings.get(key, false))
+    cb.add_theme_font_size_override("font_size", font_size)
+    cb.add_theme_constant_override("icon_max_width", font_size * 2)
+    cb.add_theme_constant_override("h_separation", 14)
+    cb.add_theme_color_override("font_color", Color(0.94, 0.94, 0.94))
+    cb.add_theme_color_override("font_hover_color", ACCENT)
+    cb.toggled.connect(_on_option_toggled.bind(key))
+    return cb
+
+
+func _on_option_toggled(enabled: bool, key: String) -> void:
+    settings[key] = enabled
+    _save_settings()
+    _log("setting %s -> %s" % [key, enabled])
+
+
+## Sits to the right of the two social icons. Their row is centred and lives at a
+## fixed fraction of the height, so we follow the same fractions instead of hard
+## pixels: the button stays put from 1080p to ultrawide.
+func _place_options_button() -> void:
+    var screen := _options_button.get_viewport_rect().size
+    var size := _options_button.size
+    _options_button.position = Vector2(
+        screen.x * 0.5 + 120.0,
+        screen.y * 0.895 - size.y * 0.5)
+
+
+func _open_options() -> void:
+    if is_instance_valid(_options_panel):
+        _options_panel.visible = true
+
+
+func _close_options() -> void:
+    if is_instance_valid(_options_panel):
+        _options_panel.visible = false
+
+
+func _unhandled_input(event: InputEvent) -> void:
+    if event is InputEventKey and event.pressed and not event.echo \
+            and event.keycode == KEY_F9:
+        if is_instance_valid(_options_panel):
+            if _options_panel.visible:
+                _close_options()
+            else:
+                _open_options()
+        get_viewport().set_input_as_handled()
+
+
+func _set_status(msg: String) -> void:
+    if is_instance_valid(_status):
+        _status.text = msg
+    _log(msg)
+
+
+func _log(msg: String) -> void:
+    print("[SovereignMod] ", msg)
+
+# --------------------------------------------------- round table: ghost portrait
+#
+# roundtable_container.roundtable_swip_characters_animation() slides the outgoing
+# knight off screen and hides them through a CHAINED tween callback:
+#
+#     tween.chain().tween_callback(previous_knight.hide)
+#
+# The callback is the ONLY thing that hides the portrait. If that tween does not run
+# to completion the knight simply stays on screen, stacked under the next one, until
+# a later swipe happens to select them again - which is exactly the reported
+# symptom. Nothing re-checks it afterwards.
+#
+# We do not try to stop the tween from being interrupted; we repair the state. Both
+# portraits are legitimately visible DURING the 0.4 s slide, so a stray is only
+# hidden once it has been seen unselected for several consecutive ticks - well past
+# the end of any legitimate animation.
+
+const GHOST_TICKS := 5            # ~1.5 s at one tick per 0.3 s
+
+var _ghost_ticks := {}            # portrait instance id -> consecutive stray ticks
+
+
+func _fix_ghost_portraits() -> void:
+    if not is_instance_valid(_roundtable) or not _roundtable.is_visible_in_tree():
+        _ghost_ticks.clear()
+        return
+    var box = _roundtable.characters_container
+    var kn = _roundtable.current_selected_knight
+    if not is_instance_valid(box) or not is_instance_valid(kn):
+        _ghost_ticks.clear()
+        return
+    # Compared by ink id rather than through get_knight_portrait(): that helper
+    # indexes a dictionary directly and would fault on a knight it does not hold.
+    var want := String(kn.character_ink_id).to_lower()
+    var still := {}
+    for portrait in box.get_children():
+        if not portrait.visible:
+            continue
+        var who = portrait.character
+        if is_instance_valid(who) and String(who.character_ink_id).to_lower() == want:
+            continue
+        var id: int = portrait.get_instance_id()
+        var n: int = int(_ghost_ticks.get(id, 0)) + 1
+        if n >= GHOST_TICKS:
+            portrait.hide()
+            _log("cleared a portrait the swipe left behind")
+            continue
+        still[id] = n
+    _ghost_ticks = still
+
+
+# ------------------------------------------------- end-of-cycle results speed-up
+#
+# The game has a fast-forward button, but it only multiplies tweens and
+# AnimationPlayers (`FAST_FORWARD_SPEED_UP = 8.0`, applied through
+# `set_speed_scale`). The recap is actually paced by ~15 hard-coded
+# `await get_tree().create_timer(...)` waits in cycle_transition.gd and
+# gauge_controller.gd - 0.25 s between tag groups, 0.15 s after each score bubble -
+# and the button does not touch a single one of them. That is why holding it down
+# still feels slow.
+#
+# Engine.time_scale is the one lever that also covers SceneTreeTimer, so it speeds
+# up the dead time too. It stacks with the game's own button: tweens end up at
+# speed x 8.
+#
+# We never restore to a hard-coded 1.0. The game exposes its own speed setting
+# (1.0 / 1.2 / 1.5 in the menu, `Engine.time_scale = user_settings.game_speed`), and
+# resetting to 1.0 would silently undo the player's choice.
+
+var _time_scale_ours := false
+
+
+func _process(_delta: float) -> void:
+    var on_recap: bool = (settings.get("fast_results", false)
+                          and is_instance_valid(_cycle_end)
+                          and _cycle_end.is_visible_in_tree())
+    if on_recap:
+        var speed: float = maxf(1.0, float(settings.get("result_speed", 2.0)))
+        Engine.time_scale = _player_speed() * speed
+        _time_scale_ours = true
+    elif _time_scale_ours:
+        _restore_time_scale()
+
+
+func _restore_time_scale() -> void:
+    if not _time_scale_ours:
+        return
+    _time_scale_ours = false
+    Engine.time_scale = _player_speed()
+
+
+## Safety net: if the mod is ever unloaded while the recap is up, the game must not
+## be left running at the boosted speed.
+func _exit_tree() -> void:
+    _restore_time_scale()
+
+
+## The speed the player picked in the game's own settings, so we scale FROM it
+## instead of overwriting it.
+func _player_speed() -> float:
+    var sc = get_node_or_null("/root/SettingsController")
+    if sc == null or not ("current_user_settings" in sc):
+        return 1.0
+    var us = sc.current_user_settings
+    if us == null or not ("game_speed" in us):
+        return 1.0
+    return maxf(0.1, float(us.game_speed))
+
+
+
+
+# ------------------------------------------------------- round table detection
+#
+# We do NOT graft onto the game's interface hierarchy: the panel lives in our own
+# CanvasLayer, shown only while the round table is up. Far less brittle than
+# injecting into their containers.
+
+func _script_is(n: Node, suffix: String) -> bool:
+    var s = n.get_script()
+    if s == null:
+        return false
+    return String(s.resource_path).ends_with(suffix)
+
+
+# FULL paths: "home.gd" alone also matched scenes/home/debug_menu_home.gd, and the
+# mod ended up driving the wrong screen.
+func _on_node_added(n: Node) -> void:
+    if _script_is(n, "scenes/roundtable/quests_presentation_section.gd"):
+        _section = n
+        _set_status("ready")
+    elif _script_is(n, "scenes/roundtable/roundtable_container.gd"):
+        _roundtable = n
+    elif _script_is(n, "scenes/home/home.gd"):
+        _home = n
+    elif _script_is(n, "scenes/tower_view/tower_view_container.gd"):
+        _tower = n
+    elif _script_is(n, "scenes/roundtable/difficulty_hint_wheel.gd"):
+        _wheels.append(n)
+    elif _script_is(n, "scenes/dialogue_interface/choice_button.gd"):
+        _choices.append(n)
+    elif _script_is(n, "scenes/roundtable/reward_display.gd"):
+        _rewards_shown.append(n)
+    elif _script_is(n, "scenes/rooms/shops/kitchen.gd"):
+        _kitchen = n
+    elif _script_is(n, "scenes/cycle_transition/cycle_transition.gd"):
+        _cycle_end = n
+
+
+func _on_node_removed(n: Node) -> void:
+    if n == _section:
+        _section = null
+    elif n == _roundtable:
+        _roundtable = null
+    elif n == _home:
+        _home = null
+    elif n == _kitchen:
+        _kitchen = null
+    elif n == _cycle_end:
+        _cycle_end = null
+        _restore_time_scale()
+
+
+# ------------------------------------------------------------------ the button
+
+func _on_pressed() -> void:
+    if not is_instance_valid(_section):
+        _set_status("round table not found")
+        return
+    _button.disabled = true
+    # Always start from an empty board. Applying on top of an existing assignment left
+    # leftovers behind: a knight the plan does not use stayed on his quest, and gear the
+    # plan wanted was still worn by someone else, so it could not be handed over.
+    # Clearing first makes the button idempotent - press it twice, get the same board.
+    var freed := _clear_assignments()
+    var stripped := _unequip_all()
+    _set_status("computing...")
+    var plan := _run_solver()
+    if plan.is_empty():
+        _button.disabled = false
+        return
+    # The report is kept for the test bench but not shown: on a normal run it only
+    # restated what the player just watched happen on the board. The status line
+    # stays for problems, which is when it actually carries information.
+    _last_report = ("cleared %d knight(s) and %d item(s)
+" % [freed, stripped]) + _apply(plan)
+    _set_status("")
+    _button.disabled = false
+
+
+
+## ------------------------------------------------------------------ the solver
+##
+## The mod is loaded from disk, next to the game executable, so the solver sits at
+## <game>/sovereign_mod/solver/st.exe. Nothing to configure and nothing to install:
+## it carries its own Python runtime.
+
+var _solver_exe := ""                  # program to launch
+var _solver_head: Array = []           # arguments that come before the command
+var _cache_ready := false
+
+
+## Locates the solver once. Returns false when it is missing, which is the one
+## situation the player must be told about: the mod was unpacked incompletely.
+func _resolve_solver() -> bool:
+    if _solver_exe != "":
+        return true
+    var custom: String = String(settings.get("solver", ""))
+    var py: String = String(settings.get("python", ""))
+    if custom != "" and FileAccess.file_exists(custom):
+        if custom.get_extension().to_lower() == "py":
+            # Running from the Python sources: needs an interpreter.
+            if not FileAccess.file_exists(py):
+                _log("solver set to a .py file but python was not found")
+                return false
+            _solver_exe = py
+            _solver_head = [custom]
+        else:
+            _solver_exe = custom
+            _solver_head = []
+        return true
+    var exe := OS.get_executable_path().get_base_dir().path_join("sovereign_mod/solver/st.exe")
+    if not FileAccess.file_exists(exe):
+        _log("solver not found at " + exe)
+        return false
+    _solver_exe = exe
+    _solver_head = []
+    return true
+
+
+func _solver_argv(extra: Array) -> PackedStringArray:
+    var out := PackedStringArray()
+    for x in _solver_head:
+        out.append(String(x))
+    for x in extra:
+        out.append(String(x))
+    return out
+
+
+## The solver reads the game's own data files to answer. It extracts what it needs
+## from the player's copy on first launch, and again after the game is updated -
+## a few seconds, at boot, where a hitch goes unnoticed.
+func _ensure_cache() -> bool:
+    if _cache_ready:
+        return true
+    if not _resolve_solver():
+        return false
+    var out := []
+    var state := ""
+    if OS.execute(_solver_exe, _solver_argv(["cache"]), out, true) == 0:
+        for line in out:
+            var t := String(line).strip_edges()
+            if t != "":
+                state = t
+    if state == "ok":
+        _cache_ready = true
+        return true
+    if state == "nogame":
+        _log("game files not found - the mod must sit in the game folder")
+        return false
+    var report := []
+    if OS.execute(_solver_exe, _solver_argv(["setup"]), report, true) != 0:
+        _log("could not read the game data:")
+        for line in report:
+            _log(String(line))
+        return false
+    _cache_ready = true
+    _log("data cache built from the game files")
+    return true
+
+
+## Runs the solver and reads back the JSON it just wrote.
+## The solver takes ~0.1 s: a blocking call goes unnoticed.
+func _run_solver() -> Dictionary:
+    if not _ensure_cache():
+        _set_status("solver not found - reinstall the mod in the game folder")
+        return {}
+    var output := []
+    var args := ["cycle", str(settings.get("slot", 1)),
+                 "--json=" + ProjectSettings.globalize_path(PLAN_PATH)]
+    # The save is written at the end of a cycle, so a room opened DURING the cycle
+    # still reads as locked - st.py then ignored the kitchen and never advised a
+    # meal, and ignored a shop that had just opened. We hold the truth in memory, so
+    # we hand it over: one --room= per room actually unlocked.
+    for room in GameState.tower_manager.unlocked_rooms:
+        if not is_instance_valid(room):
+            continue
+        var id := String(room.resource_path).get_file().get_basename()
+        if id != "":
+            args.append("--room=" + id)
+    var code := OS.execute(_solver_exe, _solver_argv(args), output, true)
+    if code != 0:
+        _set_status("the solver failed (code %d)" % code)
+        for line in output:
+            _log(String(line))
+        return {}
+    var f := FileAccess.open(PLAN_PATH, FileAccess.READ)
+    if f == null:
+        _set_status("plan.json unreadable")
+        return {}
+    var parsed = JSON.parse_string(f.get_as_text())
+    f.close()
+    if typeof(parsed) != TYPE_DICTIONARY:
+        _set_status("plan.json malformed")
+        return {}
+    return parsed
+
+
+func _on_clear_pressed() -> void:
+    if not is_instance_valid(_section):
+        _set_status("round table not found")
+        return
+    _clear_button.disabled = true
+    var freed := _clear_assignments()
+    var stripped := _unequip_all()
+    _last_report = "%d knight(s) removed, %d item(s) returned" % [freed, stripped]
+    _set_status("")
+    _clear_button.disabled = false
+
+
+# ------------------------------------------------------------ clearing the board
+
+## Clears assignments from every quest.
+##
+## SPARES `requested_knights`: those are the knights the quest REQUIRES. The game
+## protects them everywhere (knight_slot.gd locks them, assign_knight_to_quest
+## refuses to replace them); tearing them out left the player in a state the
+## interface cannot rebuild.
+func _clear_assignments() -> int:
+    var freed := 0
+    for q in GameState.quests_manager.current_quests:
+        if not is_instance_valid(q):
+            continue
+        for k in q.assigned_knights.duplicate():
+            if not is_instance_valid(k):
+                continue
+            if k in q.requested_knights:
+                continue
+            _section._unassign_knight_from_quest(k)
+            freed += 1
+    return freed
+
+
+## Returns every worn item to stock.
+##
+## SPARES `is_exclusive` items - Ari's griffin and friends: they belong to the
+## knight, and the game's own interface already greys out their button
+## (equipment_button.gd: `disabled = equipment.is_exclusive`).
+func _unequip_all() -> int:
+    var stripped := 0
+    for knight in GameState.character_manager.roundtable_knights:
+        if not is_instance_valid(knight):
+            continue
+        for equipment in knight.equipments:
+            if not is_instance_valid(equipment):
+                continue
+            if equipment.is_exclusive:
+                continue
+            if _unequip(knight, equipment):
+                stripped += 1
+    return stripped
+
+
+## Goes through the game's own function (armor + return to stock) when available.
+func _unequip(knight, equipment) -> bool:
+    if is_instance_valid(_roundtable) and _roundtable.has_method("_on_equipment_assignation_requested"):
+        _roundtable.current_selected_knight = knight
+        _roundtable._on_equipment_assignation_requested(equipment, knight, null)
+        return true
+    if equipment is Relic:
+        knight.relic = null
+    elif equipment is Mount:
+        knight.mount = null
+    elif equipment is Consumable:
+        knight.consumable = null
+    else:
+        return false
+    knight.current_armor -= equipment.bonus_armor
+    GameState.inventory_manager.add_equipments_to_inventory([equipment])
+    return true
+
+
+# ------------------------------------------------------------------ applying
+
+func _find_quest(entry: Dictionary):
+    var qm = GameState.quests_manager
+    var wanted_id := String(entry.get("quest_id", ""))
+    var wanted_path := String(entry.get("quest_path", ""))
+    for q in qm.current_quests:
+        if not is_instance_valid(q):
+            continue
+        # quest_id first, resource path as fallback: both come from the same st.py
+        # cache, but either one may be missing on an injected quest.
+        if wanted_id != "" and String(q.quest_id) == wanted_id:
+            return q
+        if wanted_path != "" and String(q.resource_path) == wanted_path:
+            return q
+    return null
+
+
+## Applies the plan. Returns a short report, shown under the button.
+func _apply(plan: Dictionary) -> String:
+    var cm = GameState.character_manager
+    var assignments: Array = plan.get("assignments", [])
+    var equipment: Dictionary = plan.get("equipment", {})
+
+    # 1) wipe the board: drop existing assignments, otherwise we stack on top of
+    #    whatever the player had already placed.
+    _clear_assignments()
+
+    # 2) assignments, quest by quest.
+    var placed := 0
+    var missing: Array[String] = []
+    for entry in assignments:
+        var quest = _find_quest(entry)
+        if quest == null:
+            missing.append(String(entry.get("quest_id", "?")))
+            continue
+        # assign_knight_to_quest() works on `selected_quest`, so the quest has to be
+        # selected before each batch of knights.
+        _section.update_quests_panel(quest, false)
+        for kname in entry.get("knights", []):
+            var knight = cm.get_roundtable_knight_from_name(String(kname))
+            if knight == null:
+                missing.append(String(kname))
+                continue
+            _section.assign_knight_to_quest(knight)
+            placed += 1
+
+    # 3) equipment: relics and mounts only. Consumables are single-use and the
+    #    player wants to arbitrate them personally (see README, "consumables").
+    var equipped := 0
+    var to_buy: Array[String] = []
+    for kname in equipment:
+        var knight = cm.get_roundtable_knight_from_name(String(kname))
+        if knight == null:
+            continue
+        for item in equipment[kname]:
+            var kind := String(item.get("kind", ""))
+            if kind != "relic" and kind != "mount":
+                continue
+            var res = load(String(item.get("path", "")))
+            if res == null:
+                missing.append(String(item.get("id", "?")))
+                continue
+            # An item the player does not own yet still has to be BOUGHT: equipping
+            # it would hand it over for free.
+            #
+            # The plan's `owned` flag is NOT the authority here - st.py reads the
+            # save file, and the save lags behind the game. An item bought this very
+            # cycle still reads `owned: false`, and the mod was refusing to equip
+            # what the player had just paid for. `_item_available()` asks live
+            # memory instead, which cannot be fooled either way: an item still on a
+            # shop shelf is not in the player's inventory.
+            if not _item_available(res):
+                if not bool(item.get("owned", true)):
+                    to_buy.append(String(item.get("name", item.get("id", "?"))))
+                continue
+            if _equip(knight, res):
+                equipped += 1
+
+    _update_advice(plan)
+
+    var report := "%d knight(s) assigned, %d item(s) equipped" % [placed, equipped]
+    if not to_buy.is_empty():
+        report += " - still to buy: " + ", ".join(to_buy)
+    if not missing.is_empty():
+        report += " - not found: " + ", ".join(missing)
+    return report
+
+
+## Advice: what the plan recommends BUYING, and who to feed.
+##
+## The mod applies neither: purchases cost gold and happen in shops, meals are
+## served in the kitchen. It only says what to do; the player keeps their purse.
+func _update_advice(plan: Dictionary) -> void:
+    if not is_instance_valid(_advice_label):
+        return
+    _last_plan = plan
+    _plan_board = _quest_set()
+    if not settings.get("buying_advice", false):
+        _meal_label.text = ""
+        _levels_label.text = ""
+        _advice_label.text = ""
+        return
+
+    # A meal is only advised when it lifts a quest to a better outcome. When it does
+    # not, the line is dropped entirely rather than saying "none": an empty section
+    # takes its separator with it.
+    var meal = plan.get("meal")
+    if meal == null:
+        _meal_label.text = ""
+    else:
+        var who := String(meal)
+        who = who.substr(0, 1).to_upper() + who.substr(1)
+        var dishes: Array = plan.get("meal_plats", [])
+        _meal_label.text = "Meal: %s%s" % [who,
+            ("" if dishes.is_empty() else " (" + ", ".join(PackedStringArray(dishes)) + ")")]
+
+    # Which statistic to raise on the next level: st.py works it out, the player
+    # spends the point in the tower. The mod only tells.
+    #
+    # A statistic the player has ALREADY raised drops off the list: st.py reads the
+    # save, so it keeps advising a point that was spent this very cycle. `stats_base`
+    # is what the save held, equipment excluded - the same basis as
+    # `get_statistic_value_from_id(id, false)`.
+    var ups := PackedStringArray()
+    var levels: Dictionary = plan.get("levels", {})
+    var was: Dictionary = plan.get("stats_base", {})
+    for kname in levels:
+        var knight = GameState.character_manager.get_roundtable_knight_from_name(String(kname))
+        var before: Dictionary = was.get(kname, {})
+        var todo := PackedStringArray()
+        for stat in levels[kname]:
+            # Not `name`: this script extends Node, which already has one.
+            var stat_name := String(stat)
+            if knight != null and before.has(stat_name):
+                # Look the enum VALUE up by key, never its position in keys().
+                var id: int = int(Knight.Statistics.get(stat_name, -1))
+                if id >= 0 and knight.get_statistic_value_from_id(id, false) > int(before[stat_name]):
+                    continue
+            todo.append(_stat_label(stat_name))
+        if not todo.is_empty():
+            ups.append("Level up %s: %s" % [String(kname).to_upper(), ", ".join(todo)])
+    _levels_label.text = "
+".join(ups)
+
+    # Drop what the player has ALREADY bought: st.py reads the save, which lags
+    # behind the game, so it keeps recommending an item paid for this very cycle.
+    var purchases := []
+    var spend := 0
+    for a in plan.get("achats", []):
+        # An empty path would make load() spam the log on every tick. Older plans,
+        # written before st.py carried the path, have none.
+        var path := String(a.get("path", ""))
+        if path != "":
+            var res = load(path)
+            if res != null and _item_owned(res):
+                continue
+        purchases.append(a)
+        spend += int(a.get("cost", 0))
+    var lines := PackedStringArray()
+    if purchases.is_empty():
+        lines.append("Nothing to buy")
+    else:
+        lines.append("To buy (%d gold):" % spend)
+        for a in purchases:
+            lines.append("  - %s: %d gold for %s" % [
+                String(a.get("name", "?")), int(a.get("cost", 0)),
+                String(a.get("for", "?")).to_upper()])
+    _advice_label.text = "
+".join(lines)
+
+
+## Shows a rule only where it actually separates two visible sections, and hides a
+## section that has nothing to say along with the rule above it.
+func _refresh_rules() -> void:
+    var above := false
+    for lab in [_quest_label, _score_label]:
+        if is_instance_valid(lab) and lab.text != "":
+            above = true
+    for pair in [[_score_sep, _outcome_label], [_meal_sep, _meal_label],
+                 [_levels_sep, _levels_label], [_buy_sep, _advice_label]]:
+        var sep: HSeparator = pair[0]
+        var lab: Label = pair[1]
+        if not is_instance_valid(lab):
+            continue
+        # Explicit type: `lab` comes out of an untyped array, so `:=` cannot infer.
+        var has: bool = lab.text != ""
+        lab.visible = has
+        if is_instance_valid(sep):
+            sep.visible = has and above
+        if has:
+            above = true
+
+
+## Is the item actually at the player's disposal RIGHT NOW?
+##
+## The game's `get_all_available_items()` = quest items + unequipped_relics /
+## _mounts / _consumables. It EXCLUDES `pawnbroker_items`: an item sold to the
+## pawnbroker is no longer there, and equipping it would hand it back unpaid.
+##
+## We also accept items worn by a comrade who STAYED at the round table: the game
+## allows that transfer. An item that left on a quest with its bearer is not
+## recoverable.
+##
+## This check reads live memory, not the save file - which lags behind and would
+## miss a sale made this very cycle.
+func _item_available(equipment) -> bool:
+    return _available_item(equipment) != null
+
+
+## Does the player OWN this item, wherever it currently is?
+##
+## Deliberately wider than `_item_available()`: an item worn by a knight who left on
+## a quest cannot be equipped, but it is still bought and paid for. Asking the narrow
+## question made the "buy this" advice come back the moment the plan equipped the
+## item and sent its bearer off.
+func _item_owned(equipment) -> bool:
+    if equipment == null:
+        return false
+    if _available_item(equipment) != null:
+        return true
+    var wanted := String(equipment.name)
+    for kn in GameState.character_manager.roundtable_knights:
+        if not is_instance_valid(kn):
+            continue
+        for worn in kn.equipments:
+            if is_instance_valid(worn) and String(worn.name) == wanted:
+                return true
+    return false
+
+
+## The live instance to equip, or null if the player cannot use this item now.
+##
+## Returns the game's OWN object rather than a boolean: an item bought this cycle is
+## not the same instance as the one `load()` returns from disk, so comparing
+## identity alone answered "not available" for a relic the player had just paid for.
+## We fall back on the equipment name, which is its unique id, and hand back the
+## instance the inventory actually holds - passing the disk copy to the game would
+## leave a phantom in the stock.
+func _available_item(equipment):
+    if equipment == null:
+        return null
+    var wanted := String(equipment.name)
+    for free_item in GameState.inventory_manager.get_all_available_items():
+        if free_item == equipment or String(free_item.name) == wanted:
+            return free_item
+    for kn in GameState.character_manager.roundtable_knights:
+        if not is_instance_valid(kn) or is_instance_valid(kn.assigned_quest):
+            continue
+        for worn in kn.equipments:
+            if worn == equipment or String(worn.name) == wanted:
+                return worn
+    return null
+
+
+## Goes through the game's own function when available: it handles armor and stock
+## removal. Manual fallback otherwise.
+##
+## Two locks, both ways: never place an exclusive item, and never overwrite one a
+## knight wears permanently (Ari's griffin).
+func _equip(knight, equipment) -> bool:
+    if equipment.is_exclusive:
+        return false
+    # Work on the instance the game holds, not the one we loaded from disk.
+    equipment = _available_item(equipment)
+    if equipment == null:
+        return false
+    for worn in knight.equipments:
+        if is_instance_valid(worn) and worn.is_exclusive \
+                and worn.equipment_type == equipment.equipment_type:
+            return false
+    if is_instance_valid(_roundtable) and _roundtable.has_method("_on_equipment_assignation_requested"):
+        _roundtable.current_selected_knight = knight
+        _roundtable._on_equipment_assignation_requested(equipment, null, knight)
+        return true
+    if equipment is Relic:
+        knight.relic = equipment
+    elif equipment is Mount:
+        knight.mount = equipment
+    else:
+        return false
+    knight.current_armor += equipment.bonus_armor
+    GameState.inventory_manager.remove_equipment(equipment)
+    return true
