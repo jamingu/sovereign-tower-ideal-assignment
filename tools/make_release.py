@@ -26,7 +26,15 @@ VERSION = "1.0.0"
 # Modules importes tardivement par st.py : PyInstaller ne les voit pas tous.
 HIDDEN = ["plan", "advise", "risk", "meals", "trans", "unrscc", "scnparse",
           "gdd", "gdres", "stpck"]
-DROP = ["tkinter", "unittest", "pydoc", "doctest", "pdb", "xml"]
+# Rien dans le solveur ne touche au reseau ni a la crypto : PyInstaller les
+# embarquait par transitivite (random -> hashlib -> OpenSSL). Les laisser, c'est
+# livrer libcrypto, libssl et des sockets dans un mod hors-ligne -- 6 Mo pour rien,
+# et de quoi inquieter a juste titre quiconque ouvre l'archive.
+DROP = ["tkinter", "unittest", "pydoc", "doctest", "pdb", "xml",
+        "ssl", "_ssl", "socket", "_socket", "hashlib", "_hashlib",
+        "email", "http", "urllib", "ftplib", "bz2", "lzma"]
+# zipfile NON : le lanceur de PyInstaller s'en sert lui-meme, l'exclure produit un
+# exe qui ne demarre pas du tout ("No module named 'zipfile'").
 
 INSTALL_TXT = """Ideal Assignment - Sovereign Tower
 ==================================
