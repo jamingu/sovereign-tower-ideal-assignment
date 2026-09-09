@@ -68,12 +68,17 @@ def sync_mod():
     import stpck
     if not stpck.GAME:
         sys.exit("--sync: jeu introuvable (definir ST_GAME)")
-    src = os.path.join(stpck.GAME, "sovereign_mod", "main.gd")
-    if not os.path.exists(src):
-        sys.exit("--sync: %s absent" % src)
-    dst = os.path.join(ROOT, "mod", "sovereign_mod", "main.gd")
-    shutil.copyfile(src, dst)
-    print("sync :", src)
+    src_dir = os.path.join(stpck.GAME, "sovereign_mod")
+    dst_dir = os.path.join(ROOT, "mod", "sovereign_mod")
+    # Tous les .gd, pas seulement main.gd : le portage en ajoute (scoring.gd...) et
+    # en oublier un livrerait un mod qui reference un fichier absent.
+    names = sorted(f for f in os.listdir(src_dir)
+                   if f.endswith(".gd") and not f.endswith(".bak"))
+    if "main.gd" not in names:
+        sys.exit("--sync: main.gd absent de %s" % src_dir)
+    for f in names:
+        shutil.copyfile(os.path.join(src_dir, f), os.path.join(dst_dir, f))
+    print("sync :", src_dir, "->", ", ".join(names))
 
 
 def freeze():
@@ -103,8 +108,9 @@ def stage(solver_dir):
     os.makedirs(mod)
     shutil.copyfile(os.path.join(ROOT, "mod", "override.cfg"),
                     os.path.join(STAGE, "override.cfg"))
-    shutil.copyfile(os.path.join(ROOT, "mod", "sovereign_mod", "main.gd"),
-                    os.path.join(mod, "main.gd"))
+    src_mod = os.path.join(ROOT, "mod", "sovereign_mod")
+    for f in sorted(x for x in os.listdir(src_mod) if x.endswith(".gd")):
+        shutil.copyfile(os.path.join(src_mod, f), os.path.join(mod, f))
     shutil.copytree(solver_dir, os.path.join(mod, "solver"))
     with open(os.path.join(STAGE, "INSTALL.txt"), "w",
               encoding="utf-8", newline="\r\n") as f:

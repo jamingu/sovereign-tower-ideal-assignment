@@ -45,7 +45,7 @@ const MAX_WAIT := 40
 const PLAN_MAX_WAIT := 300         # ticks of 0.3 s -> 90 s
 const SPINNER := ["|", "/", "-", "\\"]
 
-const COMMANDS := ["state", "assign", "report", "clear", "scene", "quests", "knights",
+const COMMANDS := ["state", "assign", "report", "clear", "score2", "detail", "scene", "quests", "knights",
                    "load", "table", "tree", "achievements", "clean_achievements",
                    "test_lock", "test_required", "wheel", "outcomes", "test_outcome",
                    "scores", "options", "options_state", "choices", "test_choice"]
@@ -1041,6 +1041,10 @@ func _run_command(name: String) -> String:
         "report":
             return ("still computing (%ds)" % int(_plan_wait * 0.3)
                     if _plan_pending else _last_report)
+        "score2":
+            return _score2()
+        "detail":
+            return _score_detail()
         "clear":
             _on_clear_pressed()
             return "\"Clear all\" pressed\n" + _last_report
@@ -1820,6 +1824,126 @@ func _unhandled_input(event: InputEvent) -> void:
 
 
 ## `quiet` for the loader: it speaks every 0.3 s and would drown the log.
+# ------------------------------------------------------- the GDScript port, step 1
+#
+# scoring.gd grades a team the way the game itself does. This command prints its
+# verdict for every quest on the board so it can be held against what the Python
+# solver says for the same board: the two must agree to the hundredth before the
+# port goes any further.
+
+var _scoring = null                # scoring.gd, loaded once
+
+
+## The mod is loaded from disk through override.cfg, so res:// may or may not reach
+## a sibling file that is not inside the .pck. Try it, then fall back to reading the
+## file and compiling it by hand - which settles the question either way.
+func _load_scoring():
+    if _scoring != null:
+        return _scoring
+    _scoring = load("res://sovereign_mod/scoring.gd")
+    if _scoring != null:
+        _log("scoring.gd loaded through res://")
+        return _scoring
+    var p := OS.get_executable_path().get_base_dir().path_join("sovereign_mod/scoring.gd")
+    var f := FileAccess.open(p, FileAccess.READ)
+    if f == null:
+        _log("scoring.gd not found at " + p)
+        return null
+    var src := f.get_as_text()
+    f.close()
+    var gd := GDScript.new()
+    gd.source_code = src
+    if gd.reload() != OK:
+        _log("scoring.gd failed to compile")
+        return null
+    _scoring = gd
+    _log("scoring.gd compiled from disk")
+    return _scoring
+
+
+func _outcome_name(v: int) -> String:
+    for k in Quest.QuestOutcomes.keys():
+        if Quest.QuestOutcomes[k] == v:
+            return String(k)
+    return str(v)
+
+
+func _score2() -> String:
+    var S = _load_scoring()
+    if S == null:
+        return "scoring.gd could not be loaded"
+    var out := PackedStringArray([S.ping()])
+    for q in GameState.quests_manager.current_quests:
+        if not is_instance_valid(q):
+            continue
+        var team := []
+        for k in q.assigned_knights:
+            if is_instance_valid(k):
+                team.append(k)
+        if team.is_empty():
+            continue
+        var r: Dictionary = S.score(q, team)
+        var names := PackedStringArray()
+        for k in team:
+            names.append(String(k.character_ink_id))
+        var label := "UNEXPECTED_OUTCOME"
+        if not bool(r["special"]):
+            label = _outcome_name(int(r["outcome"]))
+        out.append("%-46s %7.2f  %-18s %s" % [
+            String(q.quest_id).substr(0, 46), float(r["score"]), label,
+            ",".join(names)])
+    return "\n".join(out)
+
+
+## Every term of the score, knight by knight, so a disagreement with the Python
+## solver can be pinned on a line rather than guessed at.
+func _score_detail() -> String:
+    var S = _load_scoring()
+    if S == null:
+        return "scoring.gd could not be loaded"
+    var out := PackedStringArray()
+    for q in GameState.quests_manager.current_quests:
+        if not is_instance_valid(q):
+            continue
+        var team := []
+        for k in q.assigned_knights:
+            if is_instance_valid(k):
+                team.append(k)
+        if team.is_empty():
+            continue
+        var r: Dictionary = S.score(q, team)
+        out.append("### %s   total %.2f" % [String(q.quest_id), float(r["score"])])
+        var req: Dictionary = S.requirements_of(q)
+        var reqs := PackedStringArray()
+        for st_ in req:
+            reqs.append("%s=%d" % [Knight.Statistics.keys()[st_], int(req[st_])])
+        out.append("    requis %s | demandes %d | equipe %d"
+                   % [" ".join(reqs), int(q.nb_requested_knights), team.size()])
+        var per: Dictionary = r["per_knight"]
+        for k in team:
+            var ks = per.get(k)
+            if ks == null:
+                continue
+            var bits := PackedStringArray()
+            bits.append("presence %.2f" % ks.presence_score)
+            if ks.meal_score != 0.0:
+                bits.append("repas %.2f" % ks.meal_score)
+            for st_ in ks.stats_score:
+                bits.append("%s %.2f" % [Knight.Statistics.keys()[st_],
+                                         float(ks.stats_score[st_])])
+            for d in [["bonus+", ks.known_bonuses], ["bonus?", ks.unknown_bonuses],
+                      ["malus+", ks.known_maluses], ["malus?", ks.unknown_maluses]]:
+                var dict: Dictionary = d[1]
+                for tag in dict:
+                    bits.append("%s %s %.2f" % [d[0],
+                                                TagManager.CharacterTags.keys()[tag],
+                                                float(dict[tag])])
+            out.append("    %-11s %6.2f   %s" % [String(k.character_ink_id),
+                                                 ks.get_total_score(),
+                                                 "  ".join(bits)])
+    return "\n".join(out)
+
+
 func _set_status(msg: String, quiet: bool = false) -> void:
     if is_instance_valid(_status):
         _status.text = msg
