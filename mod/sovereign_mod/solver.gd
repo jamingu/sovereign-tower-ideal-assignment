@@ -974,6 +974,60 @@ func _slot_item(g: PackedInt32Array, slot: int) -> int:
     return -1
 
 
+# ------------------------------------------------------------------------ meals
+
+## Who should get the meal, if anyone.
+##
+## Only ever advised when it CHANGES AN OUTCOME. A meal is one use and the player
+## decides those personally; suggesting one for a fraction of a point wastes it, so
+## a knight who is already comfortably critical is not a candidate however much the
+## number would move.
+func _meal_advice(picks: Array, gear: Array) -> Dictionary:
+    var best := {}
+    for pi in range(picks.size()):
+        var qi: int = picks[pi]["quest"]
+        var team: PackedInt32Array = picks[pi]["team"]
+        var plain := score_team(qi, team, gear[pi])
+        if bool(plain["special"]):
+            continue
+        var plain_tier := _tier_of(qi, float(plain["score"]))
+        for ki in team:
+            var fed := PackedInt32Array([ki])
+            var with_meal := score_team(qi, team, gear[pi], fed)
+            if bool(with_meal["special"]):
+                continue
+            var lifted := _tier_of(qi, float(with_meal["score"]))
+            if lifted <= plain_tier:
+                continue
+            var gain: float = float(with_meal["score"]) - float(plain["score"])
+            if best.is_empty() or lifted - plain_tier > int(best["tiers"])                     or (lifted - plain_tier == int(best["tiers"]) and gain > float(best["gain"])):
+                best = {"knight": knights[ki]["id"], "quest_id": quests[qi]["id"],
+                        "tiers": lifted - plain_tier, "gain": gain,
+                        "from": _tier_name(plain_tier), "to": _tier_name(lifted)}
+    return best
+
+
+## Outcome rank, so "does the meal lift a tier" has an answer.
+func _tier_of(qi: int, s: float) -> int:
+    match _scoring.outcome_for_score(quests[qi]["ref"], s):
+        Quest.QuestOutcomes.CRITICAL_SUCCESS: return 4
+        Quest.QuestOutcomes.GREAT_SUCCESS: return 3
+        Quest.QuestOutcomes.SUCCESS: return 2
+        Quest.QuestOutcomes.FAILURE: return 1
+        Quest.QuestOutcomes.MAJOR_FAILURE: return 0
+    return -1
+
+
+func _tier_name(t: int) -> String:
+    match t:
+        4: return "critical success"
+        3: return "great success"
+        2: return "success"
+        1: return "failure"
+        0: return "major failure"
+    return "critical failure"
+
+
 # ------------------------------------------------------------------ entry point
 
 ## Works out the cycle. Everything above is pure computation on the snapshot, so
@@ -1088,9 +1142,15 @@ func plan() -> Dictionary:
             "base_duration": quests[qi]["base_d"],
             "value": v,
         })
+    var meal := _meal_advice(picks, gear)
     t_gear = Time.get_ticks_usec() - t_gear
     _trace("plan: done")
-    return {"assignments": out, "value": total, "us": Time.get_ticks_usec() - t0,
+    # `meal` stays a plain knight name so the panel renders it the way it always
+    # has; the detail rides alongside.
+    return {"assignments": out,
+            "meal": (null if meal.is_empty() else meal["knight"]),
+            "meal_info": meal, "value": total,
+            "us": Time.get_ticks_usec() - t0,
             "us_teams": t_teams, "us_search": t_search, "us_gear": t_gear,
             "climbs": climbs, "nodes": _nodes, "pool": pool.size(),
             "evals": _qv_memo.size()}

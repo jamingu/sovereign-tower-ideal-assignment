@@ -45,7 +45,7 @@ const MAX_WAIT := 40
 const PLAN_MAX_WAIT := 300         # ticks of 0.3 s -> 90 s
 const SPINNER := ["|", "/", "-", "\\"]
 
-const COMMANDS := ["state", "assign", "report", "clear", "score2", "detail", "spec", "fast", "inputs", "plan2", "scene", "quests", "knights",
+const COMMANDS := ["state", "assign", "report", "clear", "score2", "detail", "spec", "fast", "inputs", "plan2", "inkprobe", "scene", "quests", "knights",
                    "load", "table", "tree", "achievements", "clean_achievements",
                    "test_lock", "test_required", "wheel", "outcomes", "test_outcome",
                    "scores", "options", "options_state", "choices", "test_choice"]
@@ -1078,6 +1078,8 @@ func _run_command(name: String) -> String:
   ".join(bad)]
         "plan2":
             return _plan2()
+        "inkprobe":
+            return _ink_probe()
         "clear":
             _on_clear_pressed()
             return "\"Clear all\" pressed\n" + _last_report
@@ -2205,6 +2207,47 @@ func _outcome_wording(v: int) -> String:
     return "-"
 
 
+## Can the mod reach the story script from inside the game?
+##
+## Naming what an audience option offers is the last thing the external solver still
+## does, and it does it by reading the compiled ink. If that text is reachable here,
+## the analysis can be ported and the binary goes away entirely.
+func _ink_probe() -> String:
+    var out := PackedStringArray()
+    var tried := ["res://content/story/master.ink.json",
+                  "res://content/master.ink.json",
+                  "res://master.ink.json"]
+    var dir := DirAccess.open("res://.godot/imported")
+    if dir != null:
+        dir.list_dir_begin()
+        var f := dir.get_next()
+        while f != "":
+            if f.begins_with("master.ink.json") and f.ends_with(".res"):
+                tried.append("res://.godot/imported/" + f)
+            f = dir.get_next()
+        dir.list_dir_end()
+    else:
+        out.append("res://.godot/imported not listable")
+    for p in tried:
+        var r = ResourceLoader.load(p)
+        if r == null:
+            out.append("%-58s -> null" % p)
+            continue
+        var props := PackedStringArray()
+        for d in r.get_property_list():
+            var n := String(d.get("name", ""))
+            if n != "" and not n.begins_with("script") and not n.begins_with("resource"):
+                props.append(n)
+        out.append("%-58s -> %s  [%s]" % [p, r.get_class(), ", ".join(props)])
+    # And the ink runtime, if the game keeps one around.
+    for n in ["InkPlayer", "Ink", "Story"]:
+        var node = get_node_or_null("/root/" + n)
+        if node != null:
+            out.append("autoload /root/%s present (%s)" % [n, node.get_class()])
+    return "
+".join(out)
+
+
 func _set_status(msg: String, quiet: bool = false) -> void:
     if is_instance_valid(_status):
         _status.text = msg
@@ -2769,8 +2812,15 @@ func _update_advice(plan: Dictionary) -> void:
         var who := String(meal)
         who = who.substr(0, 1).to_upper() + who.substr(1)
         var dishes: Array = plan.get("meal_plats", [])
-        _meal_label.text = "Meal: %s%s" % [who,
-            ("" if dishes.is_empty() else " (" + ", ".join(PackedStringArray(dishes)) + ")")]
+        # The GDScript planner says WHY: a meal is only ever advised when it lifts an
+        # outcome, so naming the tier it buys is the whole point of the line.
+        var info: Dictionary = plan.get("meal_info", {})
+        var why := ""
+        if not info.is_empty():
+            why = " - %s to %s" % [String(info.get("from", "")), String(info.get("to", ""))]
+        elif not dishes.is_empty():
+            why = " (" + ", ".join(PackedStringArray(dishes)) + ")"
+        _meal_label.text = "Meal: %s%s" % [who, why]
 
     # Which statistic to raise on the next level: st.py works it out, the player
     # spends the point in the tower. The mod only tells.
