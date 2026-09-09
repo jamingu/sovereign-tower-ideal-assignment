@@ -400,7 +400,15 @@ func _update_score() -> void:
         return
     # Same rule as the audience lookup: never block the frame on Python. The panel
     # keeps the previous figure until the new one lands, one or two ticks later.
-    if _score_pending:
+    # scoring.gd answers in microseconds by asking the game itself, so there is
+    # nothing to wait for. The pending/timeout dance below only applies to the
+    # external solver, kept as a fallback.
+    if _load_scoring() != null:
+        var sig_now := _board_signature()
+        if sig_now != _signature:
+            _signature = sig_now
+            _score_live()
+    elif _score_pending:
         _score_wait += 1
         if _score_wait > MAX_WAIT:
             _log("st.py live timed out")
@@ -2147,6 +2155,54 @@ func _apply_native(plan: Dictionary) -> String:
     if refused > 0:
         report += " (%d item(s) the game would not place)" % refused
     return report
+
+
+## The live score, computed here rather than by an external process.
+##
+## st.py had to be handed the board state through a file and answer through another,
+## because it could not see the game. scoring.gd asks the game directly, so the
+## figure is both exact and immediate - and one more reason for the binary to go.
+func _score_live() -> void:
+    var S = _load_scoring()
+    if S == null:
+        return
+    _scores.clear()
+    for q in GameState.quests_manager.current_quests:
+        if not is_instance_valid(q):
+            continue
+        var team := []
+        for k in q.assigned_knights:
+            if is_instance_valid(k):
+                team.append(k)
+        if team.is_empty():
+            continue
+        var r: Dictionary = S.score(q, team)
+        var qid := String(q.quest_id)
+        if bool(r["special"]):
+            _scores[qid] = "UNEXPECTED OUTCOME"
+        else:
+            _scores[qid] = "%.2f/10 - %s" % [float(r["score"]),
+                                             _outcome_wording(int(r["outcome"]))]
+
+
+## Quest.QuestOutcomes as the panel says it, in the wording the game itself uses.
+func _outcome_wording(v: int) -> String:
+    match v:
+        Quest.QuestOutcomes.CRITICAL_SUCCESS:
+            return "CRITICAL SUCCESS"
+        Quest.QuestOutcomes.GREAT_SUCCESS:
+            return "GREAT SUCCESS"
+        Quest.QuestOutcomes.SUCCESS:
+            return "SUCCESS"
+        Quest.QuestOutcomes.FAILURE:
+            return "FAILURE"
+        Quest.QuestOutcomes.MAJOR_FAILURE:
+            return "MAJOR FAILURE"
+        Quest.QuestOutcomes.CRITICAL_FAILURE:
+            return "CRITICAL FAILURE"
+        Quest.QuestOutcomes.UNEXPECTED_OUTCOME:
+            return "UNEXPECTED OUTCOME"
+    return "-"
 
 
 func _set_status(msg: String, quiet: bool = false) -> void:
