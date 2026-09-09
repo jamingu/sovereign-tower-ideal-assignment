@@ -45,7 +45,7 @@ const MAX_WAIT := 40
 const PLAN_MAX_WAIT := 300         # ticks of 0.3 s -> 90 s
 const SPINNER := ["|", "/", "-", "\\"]
 
-const COMMANDS := ["state", "assign", "report", "clear", "score2", "detail", "spec", "fast", "inputs", "plan2", "inkprobe", "scene", "quests", "knights",
+const COMMANDS := ["state", "assign", "report", "clear", "score2", "detail", "spec", "fast", "inputs", "plan2", "inkprobe", "probe2", "scene", "quests", "knights",
                    "load", "table", "tree", "achievements", "clean_achievements",
                    "test_lock", "test_required", "wheel", "outcomes", "test_outcome",
                    "scores", "options", "options_state", "choices", "test_choice"]
@@ -1080,6 +1080,8 @@ func _run_command(name: String) -> String:
             return _plan2()
         "inkprobe":
             return _ink_probe()
+        "probe2":
+            return _probe_shops_and_levels()
         "clear":
             _on_clear_pressed()
             return "\"Clear all\" pressed\n" + _last_report
@@ -2248,6 +2250,97 @@ func _ink_probe() -> String:
 ".join(out)
 
 
+## Is the shop stock, and the pending level-ups, reachable from the round table?
+##
+## Both came from the Python plan. The stock lives on the game-state scene rather
+## than behind a manager, so the question is which node holds it and under what
+## name; the level-ups are a threshold on the knight.
+func _probe_shops_and_levels() -> String:
+    var out := PackedStringArray(["--- game state tree ---"])
+    var names := PackedStringArray()
+    var walk := [GameState]
+    while not walk.is_empty():
+        var w = walk.pop_back()
+        if not is_instance_valid(w):
+            continue
+        names.append(String(w.name))
+        for c in w.get_children():
+            walk.append(c)
+    out.append("  " + ", ".join(names))
+    out.append("--- stock-looking properties ---")
+    var stack := [GameState]
+    while not stack.is_empty():
+        var n = stack.pop_back()
+        if not is_instance_valid(n):
+            continue
+        for c in n.get_children():
+            stack.append(c)
+        for d in n.get_property_list():
+            var pname := String(d.get("name", ""))
+            var low := pname.to_lower()
+            # The stock is not called anything obvious: forge_relics, stables_mounts,
+            # witch_tower_consumables, each with _act_2 and _act_3 variants.
+            if not ("available" in low or "shop" in low or "stock" in low
+                    or "equipment" in low or "meal" in low or "relic" in low
+                    or "mount" in low or "consumable" in low or "forge" in low
+                    or "stable" in low or "witch" in low):
+                continue
+            var v = n.get(pname)
+            var size := -1
+            if v is Array:
+                size = v.size()
+            elif v is Dictionary:
+                size = v.size()
+            if size >= 0:
+                out.append("  %s.%s  (%s, %d)" % [n.name, pname,
+                    ("Array" if v is Array else "Dictionary"), size])
+    out.append("--- stock shape ---")
+    var im = GameState.inventory_manager
+    for pname in ["forge_relics", "stables_mounts", "witch_tower_consumables"]:
+        if not (pname in im):
+            out.append("  %s: absent" % pname)
+            continue
+        var d = im.get(pname)
+        if not (d is Dictionary):
+            out.append("  %s: %s" % [pname, str(typeof(d))])
+            continue
+        out.append("  %s: %d entree(s)" % [pname, d.size()])
+        var shown := 0
+        for k in d:
+            if shown >= 3:
+                break
+            shown += 1
+            var v = d[k]
+            var kd := "?"
+            if k is Resource:
+                kd = "%s '%s' cost=%s excl=%s" % [k.get_class(), str(k.get("name")),
+                                                  str(k.get("cost")), str(k.get("is_exclusive"))]
+            else:
+                kd = str(k)
+            var vd := str(v)
+            if v is Object:
+                vd = "%s [%s]" % [v.get_class(), str(v.get("item") if "item" in v else "-")]
+            out.append("     %s  ->  %s" % [kd, vd.substr(0, 90)])
+    out.append("  act = %s | funds = %s" % [
+        str(GameState.act_manager.get("current_act") if "current_act" in GameState.act_manager else "?"),
+        str(GameState.funds_manager.get("current_funds") if "current_funds" in GameState.funds_manager else "?")])
+    out.append("--- levels ---")
+    for k in GameState.character_manager.roundtable_knights:
+        if not is_instance_valid(k):
+            continue
+        var lvl: int = int(k.current_level)
+        var xp: int = int(k.current_xp)
+        var need := -1
+        var thr = LevelUpManager.level_xp_threshold
+        if thr is Dictionary and thr.has(lvl):
+            need = int(thr[lvl])
+        out.append("  %-11s level %d  xp %d/%s  mastered %s" % [
+            String(k.character_ink_id), lvl, xp,
+            ("?" if need < 0 else str(need)), str(k.mastered_stats)])
+    return "
+".join(out)
+
+
 func _set_status(msg: String, quiet: bool = false) -> void:
     if is_instance_valid(_status):
         _status.text = msg
@@ -2854,7 +2947,11 @@ func _update_advice(plan: Dictionary) -> void:
     # behind the game, so it keeps recommending an item paid for this very cycle.
     var purchases := []
     var spend := 0
-    for a in plan.get("achats", []):
+    # "achats" from the Python plan, "buy" from the one computed here.
+    var offers: Array = plan.get("achats", [])
+    if offers.is_empty():
+        offers = plan.get("buy", [])
+    for a in offers:
         # An empty path would make load() spam the log on every tick. Older plans,
         # written before st.py carried the path, have none.
         var path := String(a.get("path", ""))

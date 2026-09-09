@@ -28,6 +28,7 @@ var knights := []          # index -> knight record
 var quests := []           # index -> quest record
 var items := []            # index -> item record
 var by_ref := {}           # Knight -> index
+var for_sale := []         # item indices the shops have, never placed, only advised
 
 var _special = null         # special.gd
 var _scoring = null         # scoring.gd
@@ -111,6 +112,24 @@ func snapshot() -> String:
     for eq in _vault_items():
         if is_instance_valid(eq) and not seen.has(eq):
             seen[eq] = _add_item(eq)
+    # What the shops have. Measured like everything else, but deliberately kept OUT
+    # of the pool: the planner must never place gear the player has not bought. It
+    # only ever appears as advice, with its price attached.
+    for_sale.clear()
+    var owned_names := {}
+    for it in range(items.size()):
+        owned_names[items[it]["name"]] = true
+    for row in _stock():
+        var eq = row["ref"]
+        # Already seen means the player HAS it - a shop keeps listing what you own,
+        # and the shop entry is often the very same resource. Marking it as stock
+        # took it out of the planner's pool: the pool fell from 47 items to 26 and
+        # the plans got worse, which is how this surfaced.
+        if seen.has(eq) or owned_names.has(String(eq.name)):
+            continue
+        seen[eq] = _add_item(eq)
+        items[seen[eq]]["cost"] = int(row["cost"])
+        for_sale.append(seen[eq])
 
     for q in GameState.quests_manager.current_quests:
         if not is_instance_valid(q):
@@ -169,6 +188,48 @@ func _add_item(eq) -> int:
 ## Equipment sitting in the tower rather than on a knight.
 func _vault_items() -> Array:
     return GameState.inventory_manager.get_all_available_items()
+
+
+## Never advised, at the player's request.
+const BANNED := ["WISH_GRANTING_LAMP"]
+
+
+## What the shops are selling that the player could actually pay for.
+##
+## Stock lives on InventoryManager as one dictionary per shop and per act, keyed by
+## the equipment itself. The value carries the requirement: when its `item` is set,
+## the thing is bought with a QUEST ITEM and not with gold, and advising it as if it
+## cost money sends the player after a demon heart they do not have.
+func _stock() -> Array:
+    var im = GameState.inventory_manager
+    var act := 1
+    var am = GameState.act_manager
+    if "current_act" in am:
+        act = int(am.current_act)
+    var out := []
+    for base in ["forge_relics", "stables_mounts", "witch_tower_consumables"]:
+        for a in range(1, act + 1):
+            var prop: String = base if a == 1 else "%s_act_%d" % [base, a]
+            if not (prop in im):
+                continue
+            var d = im.get(prop)
+            if not (d is Dictionary):
+                continue
+            for eq in d:
+                if not is_instance_valid(eq):
+                    continue
+                if String(eq.name) in BANNED:
+                    continue
+                var kind: int = int(eq.equipment_type)
+                # Consumables are single use and the player arbitrates those; the mod
+                # cannot place them anyway.
+                if kind != Equipment.EquipmentsTypes.RELIC                         and kind != Equipment.EquipmentsTypes.MOUNT:
+                    continue
+                var req = d[eq]
+                if is_instance_valid(req) and "item" in req and int(req.item) != 0:
+                    continue
+                out.append({"ref": eq, "cost": int(eq.cost)})
+    return out
 
 
 ## Knights the quest imposes. They are already on it and cannot be moved.
@@ -602,9 +663,16 @@ func _prepare() -> void:
     for rec in knights:
         for it in rec["welded"]:
             welded[it] = true
+    var on_sale := {}
+    for it in for_sale:
+        on_sale[it] = true
     pool = PackedInt32Array()
     for it in range(items.size()):
         if items[it]["exclusive"] or welded.has(it):
+            continue
+        # Shop stock is measured, never placed. Letting it into the pool would have
+        # the planner hand out relics the player has not bought.
+        if on_sale.has(it):
             continue
         if items[it]["slot"] != Equipment.EquipmentsTypes.RELIC                 and items[it]["slot"] != Equipment.EquipmentsTypes.MOUNT:
             continue
@@ -974,6 +1042,87 @@ func _slot_item(g: PackedInt32Array, slot: int) -> int:
     return -1
 
 
+# --------------------------------------------------------------------- shopping
+
+## What is worth buying, given the plan we just made.
+##
+## Not "what raises the score" - the player is not interested in a tenth of a point
+## for fifty gold. Only two things earn a recommendation: an item that lifts a quest
+## into a better outcome, and one that brings a quest down to a single cycle. That is
+## the same bar the meal has to clear.
+func _buy_advice(picks: Array, gear: Array) -> Array:
+    var gold := 0
+    var fm = GameState.funds_manager
+    if "current_funds" in fm:
+        gold = int(fm.current_funds)
+    var found := []
+    for it in for_sale:
+        var cost: int = int(items[it].get("cost", 0))
+        if cost > gold:
+            continue
+        var slot: int = items[it]["slot"]
+        var best := {}
+        for pi in range(picks.size()):
+            var qi: int = picks[pi]["quest"]
+            var team: PackedInt32Array = picks[pi]["team"]
+            var before := score_team(qi, team, gear[pi])
+            var tier_before := (99 if bool(before["special"])
+                                else _tier_of(qi, float(before["score"])))
+            for j in range(team.size()):
+                if _slot_welded(team[j], slot):
+                    continue
+                var trial := []
+                for g in gear[pi]:
+                    trial.append(g)
+                var replaced := _without_slot(trial[j], slot)
+                replaced.append(it)
+                trial[j] = replaced
+                var after := score_team(qi, team, trial)
+                var tier_after := (99 if bool(after["special"])
+                                   else _tier_of(qi, float(after["score"])))
+                var cycles_saved: int = int(before["duration"]) - int(after["duration"])
+                if tier_after <= tier_before and cycles_saved <= 0:
+                    continue
+                if best.is_empty() or tier_after - tier_before > int(best["tiers"])                         or cycles_saved > int(best["cycles"]):
+                    best = {"knight": knights[team[j]]["id"],
+                            "quest_id": quests[qi]["id"],
+                            "tiers": tier_after - tier_before,
+                            "cycles": cycles_saved,
+                            "to": _tier_name(tier_after)}
+        if best.is_empty():
+            continue
+        best["name"] = items[it]["name"]
+        best["cost"] = cost
+        # `for` and `path` are the names the panel already reads, so the line renders
+        # the same whichever planner produced it.
+        best["for"] = best["knight"]
+        best["path"] = String(items[it]["ref"].resource_path)
+        found.append(best)
+    # Cheapest first among equal gains, and never advise more than the purse holds.
+    found.sort_custom(func(a, b):
+        if int(a["cycles"]) != int(b["cycles"]):
+            return int(a["cycles"]) > int(b["cycles"])
+        if int(a["tiers"]) != int(b["tiers"]):
+            return int(a["tiers"]) > int(b["tiers"])
+        return int(a["cost"]) < int(b["cost"]))
+    var spent := 0
+    var affordable := []
+    for f in found:
+        if spent + int(f["cost"]) > gold:
+            continue
+        spent += int(f["cost"])
+        affordable.append(f)
+    return affordable
+
+
+## Whether a knight has something welded into that slot, which no purchase can move.
+func _slot_welded(ki: int, slot: int) -> bool:
+    for w in knights[ki]["welded"]:
+        if items[w]["slot"] == slot:
+            return true
+    return false
+
+
 # ------------------------------------------------------------------------ meals
 
 ## Who should get the meal, if anyone.
@@ -1143,11 +1292,12 @@ func plan() -> Dictionary:
             "value": v,
         })
     var meal := _meal_advice(picks, gear)
+    var buy := _buy_advice(picks, gear)
     t_gear = Time.get_ticks_usec() - t_gear
     _trace("plan: done")
     # `meal` stays a plain knight name so the panel renders it the way it always
     # has; the detail rides alongside.
-    return {"assignments": out,
+    return {"assignments": out, "buy": buy,
             "meal": (null if meal.is_empty() else meal["knight"]),
             "meal_info": meal, "value": total,
             "us": Time.get_ticks_usec() - t0,
