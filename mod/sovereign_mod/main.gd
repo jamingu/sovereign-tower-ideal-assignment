@@ -45,7 +45,7 @@ const MAX_WAIT := 40
 const PLAN_MAX_WAIT := 300         # ticks of 0.3 s -> 90 s
 const SPINNER := ["|", "/", "-", "\\"]
 
-const COMMANDS := ["state", "assign", "report", "clear", "score2", "detail", "spec", "fast", "inputs", "plan2", "inkprobe", "probe2", "hints2", "scene", "quests", "knights",
+const COMMANDS := ["state", "assign", "report", "clear", "score2", "detail", "spec", "fast", "inputs", "plan2", "inkprobe", "probe2", "hints2", "levels2", "scene", "quests", "knights",
                    "load", "table", "tree", "achievements", "clean_achievements",
                    "test_lock", "test_required", "wheel", "outcomes", "test_outcome",
                    "scores", "options", "options_state", "choices", "test_choice"]
@@ -1098,6 +1098,8 @@ func _run_command(name: String) -> String:
             return _probe_shops_and_levels()
         "hints2":
             return _hints_native()
+        "levels2":
+            return _levels_test()
         "clear":
             _on_clear_pressed()
             return "\"Clear all\" pressed\n" + _last_report
@@ -2125,6 +2127,19 @@ func _plan2() -> String:
             ("UNEXPECTED " if bool(a["special"]) else ""),
             float(a["score"]), int(a["duration"]), int(a["base_duration"]),
             " | ".join(who)])
+    var info: Dictionary = r.get("meal_info", {})
+    if not info.is_empty():
+        lines.append("  meal: %s on %s (%s -> %s)" % [
+            String(info["knight"]).to_upper(), String(info["quest_id"]).substr(0, 34),
+            String(info["from"]), String(info["to"])])
+    for b in r.get("buy", []):
+        lines.append("  buy: %s, %d gold for %s (%s)" % [
+            String(b["name"]), int(b["cost"]), String(b["for"]).to_upper(),
+            String(b["to"])])
+    var levels: Dictionary = r.get("levels", {})
+    for kname in levels:
+        lines.append("  level up %s: %s" % [String(kname).to_upper(),
+                                            ", ".join(PackedStringArray(levels[kname]))])
     return "
 ".join(lines)
 
@@ -2472,6 +2487,34 @@ func _finish_native_plan() -> void:
 "
                     % [_plan_freed, _plan_stripped]) + _apply_native(plan)
     _set_status("")
+
+
+## Exercises the level-up advice by pretending every knight has a point banked.
+##
+## The advice only fires for a knight who actually owes a level-up, and on a mature
+## roster nobody does - seven of these ten are at the cap. Without this the code
+## would ship having produced nothing but an empty dictionary.
+func _levels_test() -> String:
+    if _native != null:
+        return "a plan is already being worked out"
+    var s = _new_solver()
+    if s == null:
+        return "solver.gd could not be loaded"
+    s.snapshot()
+    var r: Dictionary = s.plan()
+    var real: Dictionary = r.get("levels", {})
+    var out := PackedStringArray(["real advice: %s" % ("none - nobody owes a level-up"
+                                                       if real.is_empty() else str(real))])
+    for n in [1, 2]:
+        var forced: Dictionary = s.level_advice_test(n)
+        out.append("with %d point(s) each:" % n)
+        if forced.is_empty():
+            out.append("  nothing worth raising")
+        for kname in forced:
+            out.append("  %-11s %s" % [String(kname).to_upper(),
+                                       ", ".join(PackedStringArray(forced[kname]))])
+    return "
+".join(out)
 
 
 func _set_status(msg: String, quiet: bool = false) -> void:

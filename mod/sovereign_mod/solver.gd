@@ -90,6 +90,7 @@ func snapshot() -> String:
             "affinity": float(k.current_affinity),
             "worn": [],          # filled below, in item indices
             "welded": [],        # items that cannot be taken off
+            "pending": _pending_levels(k),
         })
 
     # Items: everything owned by a knight, plus everything in the vault. Each one is
@@ -183,6 +184,24 @@ func _add_item(eq) -> int:
         "exclusive": bool(eq.is_exclusive),
     })
     return items.size() - 1
+
+
+## Level-ups the player has earned and not yet spent.
+##
+## Compared against the NEXT level's threshold, not the current one: a knight who
+## has just reached level 10 is sitting on level 10's threshold by definition, so
+## testing that would report every knight as owing a point.
+func _pending_levels(k) -> int:
+    var thr = LevelUpManager.level_xp_threshold
+    if not (thr is Dictionary):
+        return 0
+    var lvl: int = int(k.current_level)
+    var xp: int = int(k.current_xp)
+    var n := 0
+    while lvl < Knight.MAX_LEVEL and thr.has(lvl + 1) and int(thr[lvl + 1]) <= xp:
+        lvl += 1
+        n += 1
+    return n
 
 
 ## Equipment sitting in the tower rather than on a knight.
@@ -633,6 +652,9 @@ const MAX_CLIMB_PASSES := 40
 
 var _nodes := 0
 var _qv_memo := {}
+# The level-up advice raises a statistic without touching the team or the gear, so
+# the cache key would not change and every trial would get the same stale answer.
+var _memo_off := false
 # Branch and bound. _suffix[at] is the most the quests from `at` onwards could add if
 # they never competed for a knight; _cut is what a plan must beat to be worth keeping.
 # Without them the search walked 400 000 arrangements, hit its own ceiling and still
@@ -726,7 +748,7 @@ func quest_value(qi: int, team: PackedInt32Array, gear: Array,
         key.append_array(g)
     key.append(-2)
     key.append_array(fed)
-    var hit = _qv_memo.get(key)
+    var hit = (null if _memo_off else _qv_memo.get(key))
     if hit != null:
         return float(hit)
     var r := score_team(qi, team, gear, fed)
@@ -738,7 +760,8 @@ func quest_value(qi: int, team: PackedInt32Array, gear: Array,
     if base_d > 1 and real_d <= 1 and (bool(r["special"]) or float(r["score"]) > 0.0):
         v += ONE_CYCLE_BONUS * float(team.size())
     v += AFFINITY_TIEBREAK * _affinity_gain(team, r)
-    _qv_memo[key] = v
+    if not _memo_off:
+        _qv_memo[key] = v
     return v
 
 
@@ -1123,6 +1146,73 @@ func _slot_welded(ki: int, slot: int) -> bool:
     return false
 
 
+# ------------------------------------------------------------------- level-ups
+
+## Which statistic each knight should raise with the points he has banked.
+##
+## Only the statistics the quest actually ASKS FOR are tried. A point elsewhere
+## looks good on the sheet and changes nothing about the quest he is going on, and
+## the player spends these by hand, one at a time, in the tower.
+## `force` pretends every knight has that many points banked. Nothing in the game
+## changes; it exists so the advice can be exercised on a save where nobody happens
+## to owe a level-up, which is most of them once the roster reaches the cap.
+func _level_advice(picks: Array, gear: Array, force: int = 0) -> Dictionary:
+    var out := {}
+    # The cache is keyed on team and gear, neither of which a level-up changes, so
+    # every trial would come back with the same stale figure.
+    _memo_off = true
+    for pi in range(picks.size()):
+        var qi: int = picks[pi]["quest"]
+        var team: PackedInt32Array = picks[pi]["team"]
+        var req: PackedInt32Array = quests[qi]["req_idx"]
+        if req.is_empty():
+            continue
+        for j in range(team.size()):
+            var ki: int = team[j]
+            var n: int = (force if force > 0 else int(knights[ki]["pending"]))
+            if n <= 0:
+                continue
+            var original: PackedInt32Array = knights[ki]["base"]
+            var best_v := quest_value(qi, team, gear[pi])
+            var best_combo := PackedInt32Array()
+            for combo in _stat_combos(req, n):
+                var trial := original.duplicate()
+                for st_ in combo:
+                    trial[st_] += 1
+                knights[ki]["base"] = trial
+                var v := quest_value(qi, team, gear[pi])
+                if v > best_v:
+                    best_v = v
+                    best_combo = combo
+            knights[ki]["base"] = original
+            if best_combo.size() > 0:
+                var names := PackedStringArray()
+                for st_ in best_combo:
+                    names.append(String(Knight.Statistics.keys()[st_]))
+                out[knights[ki]["id"]] = names
+    _memo_off = false
+    return out
+
+
+## Every way of spending `n` points across `stats`. Order does not matter, and the
+## same statistic may be raised twice.
+func _stat_combos(stats: PackedInt32Array, n: int) -> Array:
+    var out := []
+    _combos_rec(stats, n, 0, PackedInt32Array(), out)
+    return out
+
+
+func _combos_rec(stats: PackedInt32Array, n: int, start: int,
+                 pick: PackedInt32Array, out: Array) -> void:
+    if pick.size() == n:
+        out.append(PackedInt32Array(pick))
+        return
+    for i in range(start, stats.size()):
+        pick.append(stats[i])
+        _combos_rec(stats, n, i, pick, out)
+        pick.resize(pick.size() - 1)
+
+
 # ------------------------------------------------------------------------ meals
 
 ## Who should get the meal, if anyone.
@@ -1312,12 +1402,19 @@ func _search() -> Array:
         best.resize(PLANS_KEPT)
 
 
+## The level-up advice as it would read if every knight had a point to spend.
+## Read only, and used by the test bench alone.
+func level_advice_test(force: int) -> Dictionary:
+    return _level_advice(_pick_best, _gear_best, force)
+
+
 ## The finished plan, once the climbs are done.
 func plan_result() -> Dictionary:
     var picks: Array = _pick_best
     var gear: Array = _gear_best
     var meal := _meal_advice(picks, gear)
     var buy := _buy_advice(picks, gear)
+    var levels := _level_advice(picks, gear)
     _trace("plan: done")
 
     var out := []
@@ -1363,7 +1460,7 @@ func plan_result() -> Dictionary:
             "base_duration": quests[qi]["base_d"],
             "value": v,
         })
-    return {"assignments": out, "buy": buy,
+    return {"assignments": out, "buy": buy, "levels": levels,
             "meal": (null if meal.is_empty() else meal["knight"]),
             "meal_info": meal, "value": total,
             "us": Time.get_ticks_usec() - _t_start,
