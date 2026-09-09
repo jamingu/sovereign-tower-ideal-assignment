@@ -105,7 +105,11 @@ static func score(quest, team: Array) -> Dictionary:
     var missing: int = nb_requested - team.size()
     var stat_multiplier: float = 1.0 / divider
 
-    var scores := {}
+    # TYPED, and it matters: check_for_protagonist() below takes a
+    # Dictionary[Knight, KnightScore]. Handed a plain Dictionary it quietly does
+    # nothing, and the protagonist's point never lands - the same trap as
+    # are_conditions_met() further up. Godot does not warn about either.
+    var scores: Dictionary[Knight, KnightScore] = {}
     for i in range(team.size()):
         var knight = team[i]
         var ks := KnightScore.new()

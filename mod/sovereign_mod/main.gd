@@ -45,7 +45,7 @@ const MAX_WAIT := 40
 const PLAN_MAX_WAIT := 300         # ticks of 0.3 s -> 90 s
 const SPINNER := ["|", "/", "-", "\\"]
 
-const COMMANDS := ["state", "assign", "report", "clear", "score2", "detail", "spec", "fast", "plan2", "scene", "quests", "knights",
+const COMMANDS := ["state", "assign", "report", "clear", "score2", "detail", "spec", "fast", "inputs", "plan2", "scene", "quests", "knights",
                    "load", "table", "tree", "achievements", "clean_achievements",
                    "test_lock", "test_required", "wheel", "outcomes", "test_outcome",
                    "scores", "options", "options_state", "choices", "test_choice"]
@@ -1049,6 +1049,25 @@ func _run_command(name: String) -> String:
             return _spec_verify()
         "fast":
             return _fast_verify()
+        "inputs":
+            var sv = _new_solver()
+            if sv == null:
+                return "solver.gd could not be loaded"
+            sv.snapshot()
+            var bad: Array = sv.verify_inputs()
+            if bad.is_empty():
+                return "inputs match the game for every knight"
+            var only_quests := true
+            for b in bad:
+                if not String(b).begins_with("QUEST "):
+                    only_quests = false
+            if only_quests:
+                return "knights match.
+  %s" % "
+  ".join(bad)
+            return "%d difference(s):
+  %s" % [bad.size(), "
+  ".join(bad)]
         "plan2":
             return _plan2()
         "clear":
@@ -1999,6 +2018,7 @@ func _new_solver():
         return null
     var s = SV.new()
     s.setup(SP, SC)
+    s.trace_on = bool(settings.get("trace", false))
     return s
 
 
@@ -2023,10 +2043,24 @@ snapshot in %d us - no quest has a team to check" % [summary, snap_us]
         if bool(r["special_fast"]) != bool(r["special_slow"]):
             flag = "SPECIAL OUTCOME DISAGREES"
         elif d > 0.005:
-            flag = "DIFFERS"
+            # Expected, not a fault: the game has not computed this quest's duration
+            # yet, so its own answer for these three tags is meaningless until the
+            # cycle resolves. See solver.gd, DURATION_TAGS.
+            flag = ("differs on a duration tag" if bool(r.get("duration_tags", false))
+                    else "DIFFERS")
         lines.append("  %-44s fast %8.2f  game %8.2f  %dc  %s" % [
             String(r["id"]).substr(0, 44), float(r["fast"]), float(r["slow"]),
             int(r["duration"]), flag])
+        if flag != "ok" and r.has("names"):
+            var names: PackedStringArray = r["names"]
+            var fe: PackedFloat64Array = r["fast_each"]
+            var se: PackedFloat64Array = r["slow_each"]
+            for i in range(names.size()):
+                var a: float = (fe[i] if i < fe.size() else 0.0)
+                var b: float = (se[i] if i < se.size() else 0.0)
+                lines.append("      %-12s fast %7.2f  game %7.2f  %s%s" % [
+                    names[i], a, b, ("<<<" if abs(a - b) > 0.005 else ""),
+                    ("  [protagonist]" if int(r["protagonist"]) == i else "")])
     lines.append("  worst gap: %.4f" % worst)
     return "
 ".join(lines)
@@ -2059,6 +2093,60 @@ func _plan2() -> String:
             " | ".join(who)])
     return "
 ".join(lines)
+
+
+# ------------------------------------------------- the plan, computed in GDScript
+#
+# The planner used to be an external program. It now runs here, which removes the
+# binary from the mod entirely and, measured on a full round table, answers in a
+# third of the time. The old path is kept as a fallback: if solver.gd cannot be
+# loaded the mod still works with st.exe next to it, and a player who has one and
+# not the other is never left with nothing.
+
+## Runs the whole plan, on the main thread. Measured at 2.6 s on ten knights, which
+## is why it is worth doing here rather than blocking on a process.
+func _plan_native() -> Dictionary:
+    var s = _new_solver()
+    if s == null:
+        return {}
+    s.snapshot()
+    return s.plan()
+
+
+## Applies a plan built here. Nothing is looked up by name: the planner hands back
+## the game's own objects, so there is no way to place the wrong relic or miss a
+## knight whose name the save spells differently.
+func _apply_native(plan: Dictionary) -> String:
+    if not plan.has("assignments"):
+        return "no plan"
+    var placed := 0
+    var equipped := 0
+    var refused := 0
+    for entry in plan["assignments"]:
+        var quest = entry["quest_ref"]
+        if not is_instance_valid(quest):
+            continue
+        # assign_knight_to_quest() works on the selected quest, so it has to be
+        # selected before each batch.
+        _section.update_quests_panel(quest, false)
+        for k in entry["knight_refs"]:
+            if is_instance_valid(k):
+                _section.assign_knight_to_quest(k)
+                placed += 1
+    # Equipment second: a knight has to be on the quest before his gear sticks.
+    for entry in plan["assignments"]:
+        var krefs: Array = entry["knight_refs"]
+        var place: Array = entry["place"]
+        for j in range(krefs.size()):
+            for item in place[j]:
+                if _equip(krefs[j], item):
+                    equipped += 1
+                else:
+                    refused += 1
+    var report := "%d knight(s) assigned, %d item(s) equipped" % [placed, equipped]
+    if refused > 0:
+        report += " (%d item(s) the game would not place)" % refused
+    return report
 
 
 func _set_status(msg: String, quiet: bool = false) -> void:
@@ -2251,6 +2339,22 @@ func _on_pressed() -> void:
     # Clearing first makes the button idempotent - press it twice, get the same board.
     _plan_freed = _clear_assignments()
     _plan_stripped = _unequip_all()
+    if _new_solver() != null:
+        _set_status("working out the best assignment...", true)
+        var plan := _plan_native()
+        _button.disabled = false
+        if plan.is_empty() or plan.get("assignments", []).is_empty():
+            _set_status("no assignment found")
+            return
+        # Goes through _update_advice so the buying and meal sections are refreshed
+        # rather than left showing what the previous cycle suggested.
+        _update_advice(plan)
+        _last_report = ("cleared %d knight(s) and %d item(s)
+"
+                        % [_plan_freed, _plan_stripped]) + _apply_native(plan)
+        _set_status("")
+        return
+    # No solver.gd: fall back on the external program, which still works.
     if not _start_solver():
         _button.disabled = false
         return

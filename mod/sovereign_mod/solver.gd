@@ -33,6 +33,25 @@ var _special = null         # special.gd
 var _scoring = null         # scoring.gd
 
 
+## Diagnostic trail, opened and closed on every line so it survives a hard crash -
+## print() sits in a buffer that a crash takes with it, which is exactly when the
+## last line matters. Off unless someone sets trace_on.
+var trace_on := false
+
+
+func _trace(msg: String) -> void:
+    if not trace_on:
+        return
+    var f := FileAccess.open("user://sovereign_mod/trace.txt", FileAccess.READ_WRITE)
+    if f == null:
+        f = FileAccess.open("user://sovereign_mod/trace.txt", FileAccess.WRITE)
+    if f == null:
+        return
+    f.seek_end()
+    f.store_line("%d  %s" % [Time.get_ticks_msec(), msg])
+    f.close()
+
+
 func setup(special_mod, scoring_mod) -> void:
     _special = special_mod
     _scoring = scoring_mod
@@ -51,11 +70,15 @@ func snapshot() -> String:
     for k in GameState.character_manager.roundtable_knights:
         if not is_instance_valid(k):
             continue
+        # Read RAW, not through get_statistic_value_from_id(stat, false): that call
+        # clamps to 0..15 before the equipment is added, and the game clamps only
+        # once, at the end. A knight whose base is negative would start from zero
+        # here and come out ahead - OLIVER was reading LUCK 13 where the game said
+        # 11, and the planner was sending him out on the strength of it.
         var base := PackedInt32Array()
         base.resize(NSTATS)
         for s in range(NSTATS):
-            # Equipment excluded: the search puts it back itself.
-            base[s] = k.get_statistic_value_from_id(s, false)
+            base[s] = int(k.statistics_value[s]) + int(k.bonus_stats[s])
         by_ref[k] = knights.size()
         knights.append({
             "ref": k,
@@ -405,10 +428,63 @@ func score_team(qi: int, team: PackedInt32Array, gear: Array,
         if is_instance_valid(extra) and extra.is_condition_met():
             total += 2.0
 
-    return {"score": total, "special": false, "duration": dur}
+    return {"score": total, "special": false, "duration": dur,
+            "per_knight": subtotal, "protagonist": protagonist}
 
 
 # --------------------------------------------------------------- self-checking
+
+## Compares the INPUTS of the fast path against the game's own, for the board as it
+## stands: the six statistics, and the set of characteristics. If a score disagrees
+## it is either because the inputs differ or because the formula does, and there is
+## no point arguing about the formula until this comes back empty.
+func verify_inputs() -> Array:
+    var problems := []
+    for ki in range(knights.size()):
+        var k = knights[ki]["ref"]
+        var gear := PackedInt32Array()
+        for it in knights[ki]["worn"]:
+            gear.append(it)
+        var mine := stats_of(ki, gear)
+        for st_ in range(NSTATS):
+            var theirs: int = k.get_statistic_value_from_id(st_, true)
+            if mine[st_] != theirs:
+                problems.append("%s: stat %s = %d, game says %d" % [
+                    knights[ki]["id"], Knight.Statistics.keys()[st_], mine[st_], theirs])
+        var my_chars := chars_of(ki, gear)
+        var their_chars: Dictionary = k.get_all_characteristics()
+        for t in my_chars:
+            if not t in their_chars:
+                problems.append("%s: tag %s invented" % [
+                    knights[ki]["id"], TagManager.CharacterTags.keys()[t]])
+        for t in their_chars:
+            if not t in my_chars:
+                problems.append("%s: tag %s missing" % [
+                    knights[ki]["id"], TagManager.CharacterTags.keys()[t]])
+    return problems
+
+
+## The quest durations the planner works with.
+##
+## The game leaves base_duration and updated_duration at -1 until the cycle is
+## resolved, so anything that reads them BEFORE that - and three special cases do,
+## SPEEDSTER, PATIENT and OVERWORKED - gets an answer that has nothing to do with
+## the quest. The planner computes them instead, which is what the game will end up
+## with. scoring.gd, asking the game directly, is the one that cannot know yet.
+const DURATION_TAGS := [TagManager.CharacterTags.SPEEDSTER,
+                        TagManager.CharacterTags.PATIENT,
+                        TagManager.CharacterTags.OVERWORKED]
+
+
+## True when a knight carries a tag whose value depends on a duration the game has
+## not computed yet, so a disagreement with scoring.gd is expected there.
+func duration_tag_on(ki: int, gear: PackedInt32Array) -> bool:
+    var chars := chars_of(ki, gear)
+    for t in DURATION_TAGS:
+        if t in chars:
+            return true
+    return false
+
 
 ## Grades the board as it actually stands, through the fast path, and hands back the
 ## figures so they can be held against scoring.gd - which asks the game directly.
@@ -437,8 +513,26 @@ func verify_against_scoring() -> Array:
             continue
         var fast := score_team(qi, team, gear, fed)
         var slow: Dictionary = _scoring.score(q["ref"], refs)
+        var mine := PackedFloat64Array()
+        if fast.has("per_knight"):
+            mine = fast["per_knight"]
+        var theirs := PackedFloat64Array()
+        var names := PackedStringArray()
+        for k in refs:
+            names.append(String(k.character_ink_id))
+            var per: Dictionary = slow.get("per_knight", {})
+            theirs.append(0.0 if not per.has(k) else float(per[k].get_total_score()))
+        var duration_tags := false
+        for j in range(team.size()):
+            if duration_tag_on(team[j], gear[j]):
+                duration_tags = true
         rows.append({
             "id": q["id"],
+            "duration_tags": duration_tags,
+            "names": names,
+            "fast_each": mine,
+            "slow_each": theirs,
+            "protagonist": int(fast.get("protagonist", -1)),
             "fast": float(fast["score"]),
             "slow": (SPECIAL_SCORE if bool(slow["special"]) else float(slow["score"])),
             "special_fast": bool(fast["special"]),
@@ -474,6 +568,7 @@ const PLANS_KEPT := 40
 # disjointness test kills most of them early, but not all: a cap keeps a pathological
 # board from hanging the plan.
 const MAX_NODES := 400000
+const MAX_CLIMB_PASSES := 40
 
 var _nodes := 0
 var _qv_memo := {}
@@ -762,7 +857,12 @@ func _optimise_gear(picks: Array) -> Array:
     for pi in range(picks.size()):
         value[pi] = quest_value(picks[pi]["quest"], picks[pi]["team"], gear[pi])
 
-    while true:
+    # Hard ceiling. The climb only ever takes a strictly improving move, so it
+    # cannot cycle in theory - but "in theory" is not a good enough reason to leave
+    # an unbounded loop running inside a game's main loop.
+    var passes := 0
+    while passes < MAX_CLIMB_PASSES:
+        passes += 1
         var best_gain := 0.0001
         var best_move := []
         for pi in range(picks.size()):
@@ -880,7 +980,9 @@ func _slot_item(g: PackedInt32Array, slot: int) -> int:
 ## this can be called off the main thread once the snapshot is taken.
 func plan() -> Dictionary:
     var t0 := Time.get_ticks_usec()
+    _trace("plan: start")
     _prepare()
+    _trace("plan: prepared, %d free knight(s), pool %d" % [free_knights.size(), pool.size()])
     var teams := {}
     var order := []
     var t_teams := Time.get_ticks_usec()
@@ -890,10 +992,12 @@ func plan() -> Dictionary:
             continue
         teams[qi] = list
         order.append(qi)
+        _trace("plan: quest %d -> %d team(s)" % [qi, list.size()])
     order.sort_custom(func(a, b): return float(teams[a][0]["v"]) > float(teams[b][0]["v"]))
     t_teams = Time.get_ticks_usec() - t_teams
 
     var t_search := Time.get_ticks_usec()
+    _trace("plan: search begins over %d quest(s)" % order.size())
     var best := []
     _nodes = 0
     _cut = -INF
@@ -909,6 +1013,7 @@ func plan() -> Dictionary:
         return {"assignments": [], "value": 0.0, "us": Time.get_ticks_usec() - t0}
 
     t_search = Time.get_ticks_usec() - t_search
+    _trace("plan: search done, %d node(s), %d candidate(s)" % [_nodes, best.size()])
     best.sort_custom(func(a, b): return float(a["value"]) > float(b["value"]))
     if best.size() > PLANS_KEPT:
         best.resize(PLANS_KEPT)
@@ -930,6 +1035,7 @@ func plan() -> Dictionary:
             continue
         climbed[sig] = true
         climbs += 1
+        _trace("plan: climb %d" % climbs)
         var g := _optimise_gear(cand["picks"])
         var v := 0.0
         for pi2 in range(cand["picks"].size()):
@@ -951,15 +1057,31 @@ func plan() -> Dictionary:
         for ki in team:
             names.append(knights[ki]["id"])
         var loadout := []
+        var place := []          # what actually has to be handed over
+        var krefs := []
         for j in range(team.size()):
             var worn := PackedStringArray()
+            var give := []
+            # Untyped on purpose: := cannot infer a type out of a plain Dictionary,
+            # and the mod has lost a whole file to that before.
+            var already = knights[team[j]]["worn"]
             for x in gear[pi][j]:
                 worn.append(items[x]["name"])
+                # Welded gear, and anything the knight already wears, is left alone:
+                # asking the game to equip it again is refused and would be counted
+                # as a failure.
+                if not x in already:
+                    give.append(items[x]["ref"])
             loadout.append(worn)
+            place.append(give)
+            krefs.append(knights[team[j]]["ref"])
         out.append({
             "quest_id": quests[qi]["id"],
+            "quest_ref": quests[qi]["ref"],
             "knights": names,
+            "knight_refs": krefs,
             "gear": loadout,
+            "place": place,
             "score": float(r["score"]),
             "special": bool(r["special"]),
             "duration": int(r["duration"]),
@@ -967,6 +1089,7 @@ func plan() -> Dictionary:
             "value": v,
         })
     t_gear = Time.get_ticks_usec() - t_gear
+    _trace("plan: done")
     return {"assignments": out, "value": total, "us": Time.get_ticks_usec() - t0,
             "us_teams": t_teams, "us_search": t_search, "us_gear": t_gear,
             "climbs": climbs, "nodes": _nodes, "pool": pool.size(),
