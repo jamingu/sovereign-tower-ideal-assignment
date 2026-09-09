@@ -45,7 +45,7 @@ const MAX_WAIT := 40
 const PLAN_MAX_WAIT := 300         # ticks of 0.3 s -> 90 s
 const SPINNER := ["|", "/", "-", "\\"]
 
-const COMMANDS := ["state", "assign", "report", "clear", "score2", "detail", "scene", "quests", "knights",
+const COMMANDS := ["state", "assign", "report", "clear", "score2", "detail", "spec", "fast", "plan2", "scene", "quests", "knights",
                    "load", "table", "tree", "achievements", "clean_achievements",
                    "test_lock", "test_required", "wheel", "outcomes", "test_outcome",
                    "scores", "options", "options_state", "choices", "test_choice"]
@@ -1045,6 +1045,12 @@ func _run_command(name: String) -> String:
             return _score2()
         "detail":
             return _score_detail()
+        "spec":
+            return _spec_verify()
+        "fast":
+            return _fast_verify()
+        "plan2":
+            return _plan2()
         "clear":
             _on_clear_pressed()
             return "\"Clear all\" pressed\n" + _last_report
@@ -1832,33 +1838,41 @@ func _unhandled_input(event: InputEvent) -> void:
 # port goes any further.
 
 var _scoring = null                # scoring.gd, loaded once
+var _sides := {}                   # side modules, by file name
 
 
 ## The mod is loaded from disk through override.cfg, so res:// may or may not reach
 ## a sibling file that is not inside the .pck. Try it, then fall back to reading the
 ## file and compiling it by hand - which settles the question either way.
 func _load_scoring():
-    if _scoring != null:
-        return _scoring
-    _scoring = load("res://sovereign_mod/scoring.gd")
-    if _scoring != null:
-        _log("scoring.gd loaded through res://")
-        return _scoring
-    var p := OS.get_executable_path().get_base_dir().path_join("sovereign_mod/scoring.gd")
-    var f := FileAccess.open(p, FileAccess.READ)
-    if f == null:
-        _log("scoring.gd not found at " + p)
-        return null
-    var src := f.get_as_text()
-    f.close()
-    var gd := GDScript.new()
-    gd.source_code = src
-    if gd.reload() != OK:
-        _log("scoring.gd failed to compile")
-        return null
-    _scoring = gd
-    _log("scoring.gd compiled from disk")
-    return _scoring
+    return _load_side("scoring.gd")
+
+
+func _load_side(fname: String):
+    if _sides.has(fname):
+        return _sides[fname]
+    var mod = load("res://sovereign_mod/" + fname)
+    if mod == null:
+        # Fall back to reading and compiling by hand, in case res:// only ever
+        # reaches inside the .pck on some install.
+        var p := OS.get_executable_path().get_base_dir().path_join("sovereign_mod/" + fname)
+        var f := FileAccess.open(p, FileAccess.READ)
+        if f == null:
+            _log(fname + " not found at " + p)
+            _sides[fname] = null
+            return null
+        var src := f.get_as_text()
+        f.close()
+        var gd := GDScript.new()
+        gd.source_code = src
+        if gd.reload() != OK:
+            _log(fname + " failed to compile")
+            _sides[fname] = null
+            return null
+        mod = gd
+    _sides[fname] = mod
+    _log(fname + " loaded")
+    return mod
 
 
 func _outcome_name(v: int) -> String:
@@ -1942,6 +1956,109 @@ func _score_detail() -> String:
                                                  ks.get_total_score(),
                                                  "  ".join(bits)])
     return "\n".join(out)
+
+
+## Holds special.gd against the game's own special-cases function, for every knight
+## on the board. The port has to reproduce it exactly before it can be trusted on
+## loadouts the knight is not wearing.
+func _spec_verify() -> String:
+    var SP = _load_side("special.gd")
+    if SP == null:
+        return "special.gd could not be loaded"
+    var lines := PackedStringArray()
+    var checked := 0
+    for q in GameState.quests_manager.current_quests:
+        if not is_instance_valid(q):
+            continue
+        var team := []
+        for k in q.assigned_knights:
+            if is_instance_valid(k):
+                team.append(k)
+        if team.is_empty():
+            continue
+        checked += team.size()
+        for p in SP.verify(q, team):
+            lines.append("  %s  %s" % [String(q.quest_id).substr(0, 40), String(p)])
+    if lines.is_empty():
+        return "special.gd matches the game on all %d knight(s)" % checked
+    return "%d disagreement(s) over %d knight(s):
+%s" % [
+        lines.size(), checked, "
+".join(lines)]
+
+
+## The GDScript planner's fast path, held against scoring.gd - which asks the game
+## itself. The search reads its numbers from arrays rather than from game objects,
+## so it has to be proved to give the same answer before it is allowed to choose
+## anything.
+func _new_solver():
+    var SV = _load_side("solver.gd")
+    var SP = _load_side("special.gd")
+    var SC = _load_side("scoring.gd")
+    if SV == null or SP == null or SC == null:
+        return null
+    var s = SV.new()
+    s.setup(SP, SC)
+    return s
+
+
+func _fast_verify() -> String:
+    var s = _new_solver()
+    if s == null:
+        return "solver.gd could not be loaded"
+    var t0 := Time.get_ticks_usec()
+    var summary: String = s.snapshot()
+    var snap_us := Time.get_ticks_usec() - t0
+    var rows: Array = s.verify_against_scoring()
+    if rows.is_empty():
+        return "%s
+snapshot in %d us - no quest has a team to check" % [summary, snap_us]
+    var lines := PackedStringArray(["%s | snapshot %d us" % [summary, snap_us]])
+    var worst := 0.0
+    for r in rows:
+        var d: float = abs(float(r["fast"]) - float(r["slow"]))
+        if d > worst:
+            worst = d
+        var flag := "ok"
+        if bool(r["special_fast"]) != bool(r["special_slow"]):
+            flag = "SPECIAL OUTCOME DISAGREES"
+        elif d > 0.005:
+            flag = "DIFFERS"
+        lines.append("  %-44s fast %8.2f  game %8.2f  %dc  %s" % [
+            String(r["id"]).substr(0, 44), float(r["fast"]), float(r["slow"]),
+            int(r["duration"]), flag])
+    lines.append("  worst gap: %.4f" % worst)
+    return "
+".join(lines)
+
+
+## The GDScript planner, end to end. Printed so it can be held against the plan the
+## Python solver produces for the same board.
+func _plan2() -> String:
+    var s = _new_solver()
+    if s == null:
+        return "solver.gd could not be loaded"
+    s.snapshot()
+    var r: Dictionary = s.plan()
+    var lines := PackedStringArray(["plan in %d ms | value %.2f" % [
+        int(r["us"]) / 1000, float(r["value"])],
+        "  teams %d ms | search %d ms (%d nodes) | gear %d ms (%d climbs) | pool %d | %d distinct evals" % [
+            int(r["us_teams"]) / 1000, int(r["us_search"]) / 1000, int(r["nodes"]),
+            int(r["us_gear"]) / 1000, int(r["climbs"]), int(r["pool"]), int(r["evals"])]])
+    for a in r["assignments"]:
+        var who := PackedStringArray()
+        var team: PackedStringArray = a["knights"]
+        for i in range(team.size()):
+            var worn: PackedStringArray = a["gear"][i]
+            who.append("%s%s" % [String(team[i]).to_upper(),
+                                 ("" if worn.is_empty() else " [" + ", ".join(worn) + "]")])
+        lines.append("  %-44s %s%6.2f  %dc (base %d)  %s" % [
+            String(a["quest_id"]).substr(0, 44),
+            ("UNEXPECTED " if bool(a["special"]) else ""),
+            float(a["score"]), int(a["duration"]), int(a["base_duration"]),
+            " | ".join(who)])
+    return "
+".join(lines)
 
 
 func _set_status(msg: String, quiet: bool = false) -> void:

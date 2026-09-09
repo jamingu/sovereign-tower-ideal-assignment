@@ -60,10 +60,18 @@ static func special_outcome_for(quest, team: Array):
     var mod = quest.selected_modifier
     if is_instance_valid(mod):
         pot.append_array(mod.unexpected_outcomes)
+    if pot.is_empty():
+        return null
+    # are_conditions_met() takes an Array[Knight]. Handing it a plain Array made it
+    # answer "no" on a quest that does trigger - the type has to be right, not just
+    # the contents.
+    var typed: Array[Knight] = []
+    for k in team:
+        typed.append(k)
     for so in pot:
         if not is_instance_valid(so):
             continue
-        if so.are_conditions_met(team):
+        if so.are_conditions_met(typed):
             return so
     return null
 
