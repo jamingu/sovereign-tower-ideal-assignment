@@ -1181,8 +1181,93 @@ func _tier_name(t: int) -> String:
 
 ## Works out the cycle. Everything above is pure computation on the snapshot, so
 ## this can be called off the main thread once the snapshot is taken.
-func plan() -> Dictionary:
+## Planning, in pieces, so the game keeps drawing.
+##
+## The whole thing takes about three seconds, and doing it in one call froze the
+## game for all of it - which is exactly the complaint that got the external solver
+## made asynchronous in the first place. The candidate search is quick and runs in
+## one go; the equipment climbs are forty independent passes and are handed out a
+## few milliseconds at a time.
+var _stage := 0                 # 0 idle, 1 climbing, 2 done
+var _finalists := []
+var _finalist_at := 0
+var _pick_best := []
+var _gear_best := []
+var _value_best := -INF
+var _t_start := 0
+var _t_teams := 0
+var _t_search := 0
+var _t_gear := 0
+var _climbs := 0
+var _climbed := {}
+
+
+func planning() -> bool:
+    return _stage == 1
+
+
+## Takes the snapshot and finds the candidate arrangements. Half a second at worst.
+func plan_start() -> void:
+    _stage = 1
+    _finalists = []
+    _finalist_at = 0
+    _pick_best = []
+    _gear_best = []
+    _value_best = -INF
+    _climbs = 0
+    _climbed = {}
+    _t_gear = 0
+    var found := _search()
+    _finalists = found
+    if _finalists.is_empty():
+        _stage = 2
+
+
+## Climbs finalists until the budget runs out. True once there is a plan.
+func plan_step(budget_ms: int) -> bool:
+    if _stage != 1:
+        return _stage == 2
+    var until := Time.get_ticks_msec() + budget_ms
     var t0 := Time.get_ticks_usec()
+    while _finalist_at < _finalists.size():
+        var cand = _finalists[_finalist_at]
+        _finalist_at += 1
+        var sig := ""
+        for c in cand["picks"]:
+            sig += "%d:%s;" % [int(c["quest"]), String(c["team"])]
+        if _climbed.has(sig):
+            continue
+        _climbed[sig] = true
+        _climbs += 1
+        _trace("climb %d/%d (%d picks)" % [_climbs, _finalists.size(), cand["picks"].size()])
+        var g := _optimise_gear(cand["picks"])
+        _trace("climb %d done" % _climbs)
+        var v := 0.0
+        for pi in range(cand["picks"].size()):
+            v += quest_value(cand["picks"][pi]["quest"], cand["picks"][pi]["team"], g[pi])
+        if v > _value_best:
+            _value_best = v
+            _pick_best = cand["picks"]
+            _gear_best = g
+        if Time.get_ticks_msec() >= until:
+            break
+    _t_gear += Time.get_ticks_usec() - t0
+    if _finalist_at >= _finalists.size():
+        _stage = 2
+        return true
+    return false
+
+
+func plan() -> Dictionary:
+    plan_start()
+    while not plan_step(100000):
+        pass
+    return plan_result()
+
+
+func _search() -> Array:
+    var t0 := Time.get_ticks_usec()
+    _t_start = t0
     _trace("plan: start")
     _prepare()
     _trace("plan: prepared, %d free knight(s), pool %d" % [free_knights.size(), pool.size()])
@@ -1212,41 +1297,28 @@ func plan() -> Dictionary:
     for i in range(order.size() - 1, -1, -1):
         _suffix[i] = _suffix[i + 1] + maxf(0.0, float(teams[order[i]][0]["v"]))
     _assign(order, teams, 0, {}, [], 0.0, best)
-    if best.is_empty():
-        return {"assignments": [], "value": 0.0, "us": Time.get_ticks_usec() - t0}
+    _t_teams = t_teams
+    _t_search = Time.get_ticks_usec() - t_search
+    _trace("plan: search done, %d node(s), %d candidate(s)" % [_nodes, best.size()])
+    best.sort_custom(func(a, b): return float(a["value"]) > float(b["value"]))
+    if best.size() > PLANS_KEPT:
+        best.resize(PLANS_KEPT)
+    return best
 
     t_search = Time.get_ticks_usec() - t_search
     _trace("plan: search done, %d node(s), %d candidate(s)" % [_nodes, best.size()])
     best.sort_custom(func(a, b): return float(a["value"]) > float(b["value"]))
     if best.size() > PLANS_KEPT:
         best.resize(PLANS_KEPT)
-    var t_gear := Time.get_ticks_usec()
-    var climbs := 0
 
-    # Every finalist gets its equipment worked out, and only then are they compared.
-    var picks: Array = []
-    var gear := []
-    var best_value := -INF
-    var climbed := {}
-    for cand in best:
-        # Several finalists differ only in a quest nobody was sent on. Climbing the
-        # same arrangement twice costs as much as climbing a new one.
-        var sig := ""
-        for c in cand["picks"]:
-            sig += "%d:%s;" % [int(c["quest"]), String(c["team"])]
-        if climbed.has(sig):
-            continue
-        climbed[sig] = true
-        climbs += 1
-        _trace("plan: climb %d" % climbs)
-        var g := _optimise_gear(cand["picks"])
-        var v := 0.0
-        for pi2 in range(cand["picks"].size()):
-            v += quest_value(cand["picks"][pi2]["quest"], cand["picks"][pi2]["team"], g[pi2])
-        if v > best_value:
-            best_value = v
-            picks = cand["picks"]
-            gear = g
+
+## The finished plan, once the climbs are done.
+func plan_result() -> Dictionary:
+    var picks: Array = _pick_best
+    var gear: Array = _gear_best
+    var meal := _meal_advice(picks, gear)
+    var buy := _buy_advice(picks, gear)
+    _trace("plan: done")
 
     var out := []
     var total := 0.0
@@ -1291,16 +1363,10 @@ func plan() -> Dictionary:
             "base_duration": quests[qi]["base_d"],
             "value": v,
         })
-    var meal := _meal_advice(picks, gear)
-    var buy := _buy_advice(picks, gear)
-    t_gear = Time.get_ticks_usec() - t_gear
-    _trace("plan: done")
-    # `meal` stays a plain knight name so the panel renders it the way it always
-    # has; the detail rides alongside.
     return {"assignments": out, "buy": buy,
             "meal": (null if meal.is_empty() else meal["knight"]),
             "meal_info": meal, "value": total,
-            "us": Time.get_ticks_usec() - t0,
-            "us_teams": t_teams, "us_search": t_search, "us_gear": t_gear,
-            "climbs": climbs, "nodes": _nodes, "pool": pool.size(),
+            "us": Time.get_ticks_usec() - _t_start,
+            "us_teams": _t_teams, "us_search": _t_search, "us_gear": _t_gear,
+            "climbs": _climbs, "nodes": _nodes, "pool": pool.size(),
             "evals": _qv_memo.size()}

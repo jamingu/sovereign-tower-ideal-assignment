@@ -1887,6 +1887,7 @@ func _unhandled_input(event: InputEvent) -> void:
 var _scoring = null                # scoring.gd, loaded once
 var _sides := {}                   # side modules, by file name
 var _ink = null                    # ink.gd, kept because loading the story costs 50 ms
+var _native = null                 # solver.gd mid-plan, advanced a frame at a time
 
 
 ## The mod is loaded from disk through override.cfg, so res:// may or may not reach
@@ -2098,6 +2099,10 @@ snapshot in %d us - no quest has a team to check" % [summary, snap_us]
 ## The GDScript planner, end to end. Printed so it can be held against the plan the
 ## Python solver produces for the same board.
 func _plan2() -> String:
+    # Two planners at once means two snapshots and two caches in memory for no
+    # reason. The button already refuses to start a second one.
+    if _native != null:
+        return "a plan is already being worked out"
     var s = _new_solver()
     if s == null:
         return "solver.gd could not be loaded"
@@ -2449,6 +2454,26 @@ func _quest_name(qid: String) -> String:
     return qid
 
 
+## Applies the plan the moment the last climb is done.
+func _finish_native_plan() -> void:
+    var solver = _native
+    _native = null
+    _plan_pending = false
+    if is_instance_valid(_button):
+        _button.disabled = false
+    var plan: Dictionary = solver.plan_result()
+    if plan.get("assignments", []).is_empty():
+        _set_status("no assignment found")
+        return
+    # Goes through _update_advice so the buying and meal sections are refreshed
+    # rather than left showing what the previous cycle suggested.
+    _update_advice(plan)
+    _last_report = ("cleared %d knight(s) and %d item(s)
+"
+                    % [_plan_freed, _plan_stripped]) + _apply_native(plan)
+    _set_status("")
+
+
 func _set_status(msg: String, quiet: bool = false) -> void:
     if is_instance_valid(_status):
         _status.text = msg
@@ -2532,6 +2557,13 @@ var _time_scale_ours := false
 
 
 func _process(_delta: float) -> void:
+    # A plan in progress gets a slice of each frame. Twelve milliseconds leaves the
+    # game most of its budget and still finishes in about the same wall time as the
+    # blocking version - only without the freeze.
+    if _native != null:
+        if _native.plan_step(12):
+            _finish_native_plan()
+
     var on_recap: bool = (settings.get("fast_results", false)
                           and is_instance_valid(_cycle_end)
                           and _cycle_end.is_visible_in_tree())
@@ -2639,20 +2671,19 @@ func _on_pressed() -> void:
     # Clearing first makes the button idempotent - press it twice, get the same board.
     _plan_freed = _clear_assignments()
     _plan_stripped = _unequip_all()
-    if _new_solver() != null:
-        _set_status("working out the best assignment...", true)
-        var plan := _plan_native()
-        _button.disabled = false
-        if plan.is_empty() or plan.get("assignments", []).is_empty():
-            _set_status("no assignment found")
-            return
-        # Goes through _update_advice so the buying and meal sections are refreshed
-        # rather than left showing what the previous cycle suggested.
-        _update_advice(plan)
-        _last_report = ("cleared %d knight(s) and %d item(s)
-"
-                        % [_plan_freed, _plan_stripped]) + _apply_native(plan)
-        _set_status("")
+    var solver = _new_solver()
+    if solver != null:
+        # Snapshot and candidate search happen now - half a second at worst - and
+        # the equipment work is then spread over the frames that follow, so the game
+        # keeps drawing. Doing the whole three seconds in one call froze it, which
+        # is the very thing that got fixed when the solver was external.
+        solver.snapshot()
+        solver.plan_start()
+        _native = solver
+        _plan_pending = true
+        _plan_wait = 0
+        _spin = 0
+        _tick_loader()
         return
     # No solver.gd: fall back on the external program, which still works.
     if not _start_solver():
@@ -2779,6 +2810,19 @@ func _start_solver() -> bool:
 ## Watched on every display tick. Applies the plan as soon as it lands.
 func _poll_solver() -> void:
     if not _plan_pending:
+        return
+    if _native != null:
+        # Progress is made in _process, one frame at a time; this only draws the
+        # loader and gives up if something goes badly wrong.
+        _plan_wait += 1
+        if _plan_wait > PLAN_MAX_WAIT:
+            _native = null
+            _plan_pending = false
+            if is_instance_valid(_button):
+                _button.disabled = false
+            _set_status("the planner timed out")
+            return
+        _tick_loader()
         return
     if FileAccess.file_exists(PLAN_PATH):
         _plan_pending = false
