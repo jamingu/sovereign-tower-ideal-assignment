@@ -45,7 +45,7 @@ const MAX_WAIT := 40
 const PLAN_MAX_WAIT := 300         # ticks of 0.3 s -> 90 s
 const SPINNER := ["|", "/", "-", "\\"]
 
-const COMMANDS := ["state", "assign", "report", "clear", "score2", "detail", "spec", "fast", "inputs", "plan2", "inkprobe", "probe2", "scene", "quests", "knights",
+const COMMANDS := ["state", "assign", "report", "clear", "score2", "detail", "spec", "fast", "inputs", "plan2", "inkprobe", "probe2", "hints2", "scene", "quests", "knights",
                    "load", "table", "tree", "achievements", "clean_achievements",
                    "test_lock", "test_required", "wheel", "outcomes", "test_outcome",
                    "scores", "options", "options_state", "choices", "test_choice"]
@@ -629,6 +629,13 @@ func _refresh_rewards() -> void:
     _rewards.clear()
     var ask := labels
 
+    # Read here rather than by an external process: about 50 ms to load the script
+    # once, then 20 to 35 ms per set of choices, which is why the whole spawn-and-
+    # wait dance below is now only a fallback.
+    if _read_rewards_native(ask):
+        _choice_sig = sig
+        return
+
     if not _ensure_cache():
         _choice_sig = sig
         return
@@ -1082,6 +1089,8 @@ func _run_command(name: String) -> String:
             return _ink_probe()
         "probe2":
             return _probe_shops_and_levels()
+        "hints2":
+            return _hints_native()
         "clear":
             _on_clear_pressed()
             return "\"Clear all\" pressed\n" + _last_report
@@ -1870,6 +1879,7 @@ func _unhandled_input(event: InputEvent) -> void:
 
 var _scoring = null                # scoring.gd, loaded once
 var _sides := {}                   # side modules, by file name
+var _ink = null                    # ink.gd, kept because loading the story costs 50 ms
 
 
 ## The mod is loaded from disk through override.cfg, so res:// may or may not reach
@@ -2339,6 +2349,97 @@ func _probe_shops_and_levels() -> String:
             ("?" if need < 0 else str(need)), str(k.mastered_stats)])
     return "
 ".join(out)
+
+
+## The audience-option reader, tested without an audience.
+##
+## An audience cannot be opened by script - achievement_manager listens for it and
+## the achievements are real and permanent - so the analysis is exercised on labels
+## written into hints_in.json instead, and held against what the Python solver says
+## for the same lines.
+func _hints_native() -> String:
+    var INK = _load_side("ink.gd")
+    if INK == null:
+        return "ink.gd could not be loaded"
+    var f := FileAccess.open(HINTS_IN, FileAccess.READ)
+    if f == null:
+        return "write the labels to hints_in.json first"
+    var parsed = JSON.parse_string(f.get_as_text())
+    f.close()
+    if typeof(parsed) != TYPE_DICTIONARY:
+        return "hints_in.json malformed"
+    var labels: Array = parsed.get("choices", [])
+    var ink = INK.new()
+    var t0 := Time.get_ticks_msec()
+    var story_len: int = ink.text().length()
+    var t_load := Time.get_ticks_msec() - t0
+    t0 = Time.get_ticks_msec()
+    var res: Dictionary = ink.hints(labels)
+    var t_scan := Time.get_ticks_msec() - t0
+    var out := PackedStringArray(["story %d chars loaded in %d ms | scan %d ms" % [
+        story_len, t_load, t_scan]])
+    for l in labels:
+        var row = res.get(l)
+        if row == null:
+            out.append("  %-56s NOT FOUND" % String(l).substr(0, 56))
+            continue
+        var eq: Array = row["equipment"]
+        var qs: Array = row["quests"]
+        out.append("  %-56s equipment=%s quests=%s" % [
+            String(l).substr(0, 56),
+            ("-" if eq.is_empty() else ", ".join(PackedStringArray(eq))),
+            ("-" if qs.is_empty() else ", ".join(PackedStringArray(qs)))])
+        if row.has("debug"):
+            out.append("        %s" % String(row["debug"]))
+    return "
+".join(out)
+
+
+## Names what each visible option offers, from the compiled story, in process.
+##
+## Returns false when the story cannot be read at all, so the external solver can
+## still answer for a player who has one and not the other.
+func _read_rewards_native(labels: Array) -> bool:
+    var INK = _load_side("ink.gd")
+    if INK == null:
+        return false
+    if _ink == null:
+        _ink = INK.new()
+        if _ink.text().is_empty():
+            _ink = null
+            return false
+    var found: Dictionary = _ink.hints(labels)
+    for lab in labels:
+        var row = found.get(lab)
+        var lines := PackedStringArray()
+        if row != null:
+            for id in row["equipment"]:
+                lines.append("Reward: %s" % _equipment_name(String(id)))
+            for qid in row["quests"]:
+                lines.append("Unlocks quest: %s" % _quest_name(String(qid)))
+        # "" is a real answer - this option grants nothing - and stops us asking again.
+        _rewards[String(lab)] = "
+".join(lines)
+    return true
+
+
+## The item's name as the player reads it. The script names items in its own casing,
+## and the translation keys are the upper-case id with _NAME on the end.
+func _equipment_name(id: String) -> String:
+    var key := id.to_upper() + "_NAME"
+    var shown := tr(key)
+    if shown != key and shown != "":
+        return shown
+    return id.capitalize()
+
+
+func _quest_name(qid: String) -> String:
+    var q = GameState.quests_manager.get_quest_from_id(qid)
+    if is_instance_valid(q):
+        var shown := tr(String(q.quest_name))
+        if shown != "":
+            return shown
+    return qid
 
 
 func _set_status(msg: String, quiet: bool = false) -> void:
