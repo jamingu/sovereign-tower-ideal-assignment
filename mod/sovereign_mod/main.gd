@@ -155,8 +155,15 @@ func _ready() -> void:
     _start_display()
     _build_ui()
     _build_options()
-    _ensure_cache()
-    _log("ready (solver: %s)" % (_solver_exe if _solver_exe != "" else "NOT FOUND"))
+    # The planner runs here now. The external solver is only woken if the GDScript
+    # one cannot be loaded, so a missing st.exe is the normal case and not worth a
+    # word in the log.
+    if _new_solver() != null:
+        _log("ready (planning in GDScript)")
+    else:
+        _ensure_cache()
+        _log("ready (external solver: %s)"
+             % (_solver_exe if _solver_exe != "" else "NOT FOUND"))
 
 
 # ------------------------------------------------- numbers on the difficulty wheel

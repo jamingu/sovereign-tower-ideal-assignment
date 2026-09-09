@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BUILD = os.path.join(ROOT, "build")
 STAGE = os.path.join(BUILD, "stage")
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 # Modules importes tardivement par st.py : PyInstaller ne les voit pas tous.
 HIDDEN = ["plan", "advise", "risk", "meals", "trans", "unrscc", "scnparse",
@@ -51,7 +51,8 @@ INSTALL
 
   Start the game from Steam. That is all - nothing to configure.
 
-  The first launch spends a few seconds reading the game's own data files.
+  The mod is five plain .gd text files. No program is installed and nothing is
+  run outside the game; you can read every line of it.
 
 UNINSTALL
 
@@ -102,7 +103,7 @@ def freeze():
     return out
 
 
-def stage(solver_dir):
+def stage():
     shutil.rmtree(STAGE, ignore_errors=True)
     mod = os.path.join(STAGE, "sovereign_mod")
     os.makedirs(mod)
@@ -111,7 +112,6 @@ def stage(solver_dir):
     src_mod = os.path.join(ROOT, "mod", "sovereign_mod")
     for f in sorted(x for x in os.listdir(src_mod) if x.endswith(".gd")):
         shutil.copyfile(os.path.join(src_mod, f), os.path.join(mod, f))
-    shutil.copytree(solver_dir, os.path.join(mod, "solver"))
     with open(os.path.join(STAGE, "INSTALL.txt"), "w",
               encoding="utf-8", newline="\r\n") as f:
         f.write(INSTALL_TXT)
@@ -139,7 +139,7 @@ def main():
     a = ap.parse_args()
     if a.sync:
         sync_mod()
-    path = zip_up(stage(freeze()), a.version)
+    path = zip_up(stage(), a.version)
     print("archive : %s (%.1f Mo)" % (path, os.path.getsize(path) / 1e6))
 
 
