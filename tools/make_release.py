@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BUILD = os.path.join(ROOT, "build")
 STAGE = os.path.join(BUILD, "stage")
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # Modules importes tardivement par st.py : PyInstaller ne les voit pas tous.
 HIDDEN = ["plan", "advise", "risk", "meals", "trans", "unrscc", "scnparse",
