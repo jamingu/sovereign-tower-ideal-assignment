@@ -76,6 +76,54 @@ static func special_outcome_for(quest, team: Array):
     return null
 
 
+## The two durations the tags SPEEDSTER, PATIENT and OVERWORKED are graded on.
+##
+## The game leaves base_duration and updated_duration at -1 until the cycle is
+## validated, and check_for_special_cases_for_score() reads them straight. Before
+## resolution it therefore grades every duration tag as worth nothing, and the score
+## it returns is PROVISIONAL - a knight who shortens a 3-cycle quest to 1 is owed a
+## point the game only credits at resolution. Showing that figure had the panel
+## announcing a tier the quest was going to beat.
+##
+## So they are worked out here, exactly as _set_newly_locked_quests() works them out
+## at lock-in: base is the quest's own duration, and updated comes from the game's
+## own calculate_updated_duration(), which only reads. Note that base is NOT
+## modifier-adjusted - the game stamps quest.duration raw and folds the cycle's
+## modifier into `updated` alone.
+static func durations_of(quest) -> Array:
+    var base_d: int = int(quest.base_duration)
+    if base_d <= 0:
+        base_d = int(quest.duration)
+    var upd_d: int = int(quest.updated_duration)
+    if upd_d <= 0:
+        upd_d = int(GameState.quests_manager.calculate_updated_duration(quest))
+    return [base_d, upd_d]
+
+
+## Re-grades the three duration tags in place, on the durations above.
+##
+## The conditions are the game's own, copied from special_cases.gd; only the two
+## numbers they are fed differ. A tag whose condition does not hold is REMOVED, so
+## this can never leave a stale entry behind.
+static func _fix_duration_cases(cases: Dictionary, characteristics: Dictionary,
+                                base_d: int, upd_d: int) -> void:
+    var fixed := {}
+    var shortened: int = base_d - upd_d
+    if TagManager.CharacterTags.SPEEDSTER in characteristics and shortened > 0:
+        fixed[TagManager.CharacterTags.SPEEDSTER] = float(shortened) * 0.5
+    if TagManager.CharacterTags.PATIENT in characteristics and upd_d > 1:
+        fixed[TagManager.CharacterTags.PATIENT] = 1.0
+    if TagManager.CharacterTags.OVERWORKED in characteristics and upd_d > 1:
+        fixed[TagManager.CharacterTags.OVERWORKED] = -float(upd_d - 1) * 0.5
+    for tag in [TagManager.CharacterTags.SPEEDSTER,
+                TagManager.CharacterTags.PATIENT,
+                TagManager.CharacterTags.OVERWORKED]:
+        if fixed.has(tag):
+            cases[tag] = {"score": fixed[tag], "known": characteristics[tag]}
+        elif cases.has(tag):
+            cases.erase(tag)
+
+
 ## The score a team would get on a quest, and the outcome it lands in.
 ##
 ## `team` is an Array[Knight]. Returns
@@ -104,6 +152,12 @@ static func score(quest, team: Array) -> Dictionary:
     var divider: float = 1.0 + min(0, float(team.size() - 1)) / 2.0
     var missing: int = nb_requested - team.size()
     var stat_multiplier: float = 1.0 / divider
+
+    # The durations the duration tags are graded on. See durations_of(): the game's
+    # own fields are still -1 here, so this is what the quest will RESOLVE with.
+    var durations := durations_of(quest)
+    var base_d: int = int(durations[0])
+    var upd_d: int = int(durations[1])
 
     # TYPED, and it matters: check_for_protagonist() below takes a
     # Dictionary[Knight, KnightScore]. Handed a plain Dictionary it quietly does
@@ -156,9 +210,16 @@ static func score(quest, team: Array) -> Dictionary:
                 else:
                     ks.unknown_bonuses[tag] = -1
 
-        var special_cases: Dictionary = \
+        var raw: Dictionary = \
             TagLibrary.tag_special_cases_controller.check_for_special_cases_for_score(
                 knight, quest)
+        # Copied into an UNTYPED dictionary before being touched: the game hands back
+        # a Dictionary[TagManager.CharacterTags, Dictionary], and writing into a typed
+        # container from outside is the trap that has already cost this mod twice.
+        var special_cases := {}
+        for tag in raw.keys():
+            special_cases[tag] = raw[tag]
+        _fix_duration_cases(special_cases, characteristics, base_d, upd_d)
         for tag in special_cases.keys():
             var known: bool = special_cases[tag]["known"]
             var sc: float = float(special_cases[tag]["score"])
