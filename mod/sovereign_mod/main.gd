@@ -79,39 +79,36 @@ const DEFAULTS := {
     "slot": 1,
     "assignment_button": true,
     "clear_button": true,
+    "action_buttons": true,
     "test_bench": false,
     "wheel_font_size": 32,
     "unexpected_outcomes": true,
     "wheel_numbers": true,
     "buying_advice": true,
     "live_score": true,
-    "audience_outcomes": true,
-    "audience_rewards": true,
+    "audience_info": true,
     "reward_names": true,
     "meal_likes": true,
     "fast_results": true,
     "fast_ending": true,
     "ending_speed": 3.0,
-    "fix_ghost_portrait": true,
     "result_speed": 4.0,
 }
 
 ## What the options screen offers to tick: setting key -> label, in display order.
 const OPTIONS := [
-    ["assignment_button", "Show the \"Auto-assignement\" button"],
-    ["clear_button", "Show the \"Clear all\" button"],
-    ["wheel_numbers", "Show numbers on the difficulty wheel"],
-    ["unexpected_outcomes", "Show unexpected outcomes"],
-    ["live_score", "Live quest score"],
-    ["audience_outcomes", "Audience: show a quest's unexpected outcomes"],
-    ["audience_rewards", "Audience: name the relic / mount / consumable on offer"],
-    ["reward_names", "Name the relic / mount / consumable a quest promises"],
+    ["assignment_button", "Show the \"Auto-assignment\" button"],
+    ["clear_button", "Show the \"Clear\" button"],
+    ["action_buttons", "Show the \"Meal\" and \"Train\" buttons"],
+    ["live_score", "Panel: live score of the selected quest"],
+    ["unexpected_outcomes", "Panel: unexpected outcomes of the selected quest"],
+    ["buying_advice", "Panel: what to buy, who to feed, where to spend a level"],
+    ["audience_info", "Audience: unexpected outcomes and the reward on offer"],
+    ["reward_names", "Quest card: name the relic / mount / consumable promised"],
     ["meal_likes", "Kitchen: flag the dishes a knight likes and dislikes"],
+    ["wheel_numbers", "Difficulty wheel: show the numbers"],
     ["fast_results", "Speed up the end-of-cycle results screen"],
     ["fast_ending", "Speed up the ending sequence"],
-    ["fix_ghost_portrait", "Round table: clear a portrait left behind by the swipe"],
-    ["buying_advice", "Buying and meal advice"],
-    ["test_bench", "Remote control (lets the assistant drive the game to test it)"],
 ]
 
 var settings := {}
@@ -122,6 +119,7 @@ var _button: Button
 var _clear_button: Button
 var _meal_button: Button
 var _train_button: Button
+var _row2: HBoxContainer
 var _status: Label
 var _outcome_label: Label
 var _quest_label: Label           # name of the quest the score belongs to
@@ -218,6 +216,9 @@ func _update_display() -> void:
         _button.visible = settings.get("assignment_button", true)
     if is_instance_valid(_clear_button):
         _clear_button.visible = settings.get("clear_button", true)
+    # The row goes, not just its buttons: an empty HBox still claims its separation.
+    if is_instance_valid(_row2):
+        _row2.visible = settings.get("action_buttons", true)
     if is_instance_valid(_panel):
         # The panel lives as long as it has anything to show: either button, or any
         # of the read-outs.
@@ -276,15 +277,14 @@ func _update_display() -> void:
     if settings.get("buying_advice", false) and not _last_plan.is_empty():
         _update_advice(_last_plan)
     _refresh_rules()
-    if settings.get("fix_ghost_portrait", false):
-        _fix_ghost_portraits()
+    # A bug fix, not a feature: nothing to opt out of.
+    _fix_ghost_portraits()
     if settings.get("meal_likes", false):
         _update_meal_likes()
     if settings.get("reward_names", false):
         _update_reward_chips()
-    if settings.get("audience_rewards", false):
+    if settings.get("audience_info", false):
         _refresh_rewards()
-    if settings.get("audience_outcomes", false) or settings.get("audience_rewards", false):
         _update_choices()
 
 
@@ -456,13 +456,6 @@ func _update_score() -> void:
     var cycles: int = GameState.quests_manager.calculate_updated_duration(q)
     var title := "%s - %d cycle%s" % [tr(q.quest_name), cycles,
                                       ("" if cycles == 1 else "s")]
-    # A deadline is the one thing on this panel there is no recovering from: a quest
-    # left to nobody on the cycle its deadline expires resolves as a CRITICAL FAILURE
-    # before anything is scored, consequences included. The game files it under
-    # "urgent" and says nothing more, so it is spelled out here.
-    if q.has_deadline:
-        var left: int = int(q.remaining_cycles_before_faillure)
-        title += ("  -  LAST CYCLE" if left <= 1 else "  -  deadline in %d" % left)
     _quest_label.text = title
     # A special outcome whose conditions are met SHORT-CIRCUITS the whole thing:
     # `determine_outcome()` returns UNEXPECTED_OUTCOME before scoring anything. The
@@ -719,16 +712,16 @@ func _collect_rewards() -> void:
 
 func _annotate_choice(b: Node) -> void:
     var parts := PackedStringArray()
-    if settings.get("audience_rewards", false):
+    if settings.get("audience_info", false):
         var reward: String = _rewards.get(_choice_label(b), "")
         if reward != "":
             parts.append(reward)
     var qid := String(b.related_quest_id) if ("related_quest_id" in b) else ""
-    if settings.get("audience_rewards", false) and qid != "":
+    if settings.get("audience_info", false) and qid != "":
         var loot := _quest_reward_lines(qid)
         if loot != "":
             parts.append(loot)
-    if settings.get("audience_outcomes", false) and qid != "":
+    if settings.get("audience_info", false) and qid != "":
         var t := _choice_tooltip(qid)
         if t != "":
             parts.append(t)
@@ -1116,6 +1109,11 @@ func _outcome_text(quest) -> String:
 # ------------------------------------------------------------------ test bench
 
 func _start_bench() -> void:
+    # A development tool, deliberately absent from the options screen: it is turned on
+    # by editing settings.json, which is the right amount of friction for something
+    # that reads a command file. Off means no timer at all, not a timer that returns.
+    if not settings.get("test_bench", false):
+        return
     var t := Timer.new()
     t.wait_time = 0.25
     t.autostart = true
@@ -1157,8 +1155,8 @@ func _run_command(name: String) -> String:
             _on_pressed()
             # The solver now runs in the background: the report is not ready yet.
             # Ask again with "report" once the panel stops spinning.
-            return ("\"Auto-assignement\" pressed - computing in the background"
-                    if _plan_pending else "\"Auto-assignement\" pressed\n" + _last_report)
+            return ("\"Auto-assignment\" pressed - computing in the background"
+                    if _plan_pending else "\"Auto-assignment\" pressed\n" + _last_report)
         "report":
             return ("still computing (%ds)" % int(_plan_wait * 0.3)
                     if _plan_pending else _last_report)
@@ -1793,7 +1791,7 @@ func _build_ui() -> void:
     box.add_child(row1)
 
     _button = Button.new()
-    _button.text = "Auto-assignement"
+    _button.text = "Auto-assignment"
     _button.custom_minimum_size = Vector2(0, 48)
     _button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
     _style_button(_button, 19)
@@ -1808,7 +1806,8 @@ func _build_ui() -> void:
     _clear_button.pressed.connect(_on_clear_pressed)
     row1.add_child(_clear_button)
 
-    var row2 := HBoxContainer.new()
+    _row2 = HBoxContainer.new()
+    var row2 := _row2
     row2.add_theme_constant_override("separation", 3)
     box.add_child(row2)
 
