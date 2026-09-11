@@ -145,6 +145,20 @@ func snapshot() -> String:
         var base_d: int = q.base_duration if q.base_duration > 0 else q.duration
         if is_instance_valid(q.selected_modifier):
             base_d += q.selected_modifier.duration_modification
+        # What the game stamps as quest.base_duration when the cycle is locked in:
+        # the quest's OWN duration, without the cycle modifier. base_d above folds the
+        # modifier in because that is what the team's reduction is subtracted from,
+        # but SPEEDSTER is graded on base_duration - updated_duration, so on the raw
+        # figure. The two are not interchangeable and the difference is half a point
+        # per cycle the modifier moves.
+        var raw_d: int = q.base_duration if q.base_duration > 0 else q.duration
+        # quests_manager decrements the counter BEFORE judging the quest, so 1 means
+        # this cycle is the last one this quest has.
+        var last_chance: bool = (bool(q.has_deadline)
+                                 and int(q.remaining_cycles_before_faillure) <= 1)
+        # Only on the last cycle. Before that the quest is not lost, only postponed,
+        # and pricing its rewards in would have the planner drop everything for it.
+        var lost: float = (_reward_worth(q) if last_chance else 0.0)
         var loc = GameState.world_manager.get_location_from_ID(q.quest_location)
         quests.append({
             "ref": q,
@@ -153,14 +167,234 @@ func snapshot() -> String:
             "req_val": val,
             "nb": int(q.nb_requested_knights),
             "base_d": base_d,
+            "raw_d": raw_d,
             "ultimatum": q.quest_type == Quest.QuestTypes.ULTIMATUM_QUEST,
             "coastal": is_instance_valid(loc) and loc.is_coastal,
             "eff_plus": eff["efficient_tags"],
             "eff_minus": eff["inefficient_tags"],
             "locked": _locked_knights(q),
+            "deadline": bool(q.has_deadline),
+            "remaining": int(q.remaining_cycles_before_faillure),
+            "last_chance": last_chance,
+            "lethal": bool(q.quest_can_be_lethal),
+            "fail_cost": _fail_cost(q),
+            "lost": lost,
+            # Settled in the second pass below: the probe needs the quest records to
+            # exist before it can score a single team against them.
+            "winnable": false,
+            "best_score": 0.0,
+            # Folded in here so `_skipped_cost` and the search's own skip branch both
+            # see it without being told twice.
+            "skip_pen": _skip_penalty(q) + lost,
         })
     return "%d knight(s), %d quest(s), %d item(s)" % [knights.size(), quests.size(),
                                                       items.size()]
+
+
+## Settles which expiring deadlines can still be won, and makes those come first.
+##
+## Runs inside the search, not in snapshot(): it has to judge on `free_knights` - the
+## knights the search can actually place - and not on the whole round table. A quest
+## declared winnable by a team that cannot be formed is the worst of both worlds, since
+## the plan then pays the priority whatever it does.
+func _settle_last_chance() -> void:
+    _probe_left = PROBE_EVALS
+    for qi in range(quests.size()):
+        if not quests[qi]["last_chance"]:
+            continue
+        var best := _best_possible(qi)
+        quests[qi]["best_score"] = best
+        var win: bool = (best >= SPECIAL_SCORE
+                         or _scoring.outcome_for_score(quests[qi]["ref"], best) > 0)
+        quests[qi]["winnable"] = win
+        if win:
+            quests[qi]["skip_pen"] = LAST_CHANCE_PRIORITY
+        _trace("plan: last chance %s -> best %.2f, winnable %s (%d eval left)" % [
+            String(quests[qi]["id"]), best, str(win), _probe_left])
+    # Teams were priced while `winnable` was still false everywhere.
+    _qv_memo.clear()
+
+
+## The best score any team could bring back from this quest.
+##
+## Every combination, not the ranked shortlist `_teams_for` keeps: a shortlist is a
+## performance measure, and this answer decides whether a quest is given up for good.
+## Judged with the gear the knights are ALREADY wearing - the gear climb runs later and
+## can only improve on it - and without a meal, so a quest called winnable here is
+## winnable with no further action from the player.
+func _best_possible(qi: int) -> float:
+    var forced := PackedInt32Array()
+    for ki in quests[qi]["locked"]:
+        forced.append(ki)
+    var cands := PackedInt32Array()
+    for ki in free_knights:
+        if not ki in forced:
+            cands.append(ki)
+    var pick := PackedInt32Array()
+    var size_max: int = mini(int(quests[qi]["nb"]), forced.size() + cands.size())
+    return _best_walk(qi, cands, 0, forced, pick, size_max, NO_TEAM_SCORE)
+
+
+func _best_walk(qi: int, cands: PackedInt32Array, start: int, forced: PackedInt32Array,
+                pick: PackedInt32Array, size_max: int, best: float) -> float:
+    # Bounded like every other search here. Running out means the quest keeps the
+    # best score found so far, which can only make it look LESS winnable - the safe
+    # direction: the mod may fail to prioritise a quest, it will never force a team
+    # onto one nobody could have won.
+    if _probe_left <= 0:
+        return best
+    var team := PackedInt32Array(forced)
+    for x in pick:
+        team.append(x)
+    if team.size() > 0:
+        _probe_left -= 1
+        var r := score_team(qi, team, _probe_gear(team))
+        # An unexpected outcome is not scored, and it is never a failure.
+        if bool(r["special"]):
+            return SPECIAL_SCORE
+        if float(r["score"]) > best:
+            best = float(r["score"])
+    if team.size() >= size_max:
+        return best
+    for i in range(start, cands.size()):
+        pick.append(cands[i])
+        best = _best_walk(qi, cands, i + 1, forced, pick, size_max, best)
+        pick.resize(pick.size() - 1)
+        if best >= SPECIAL_SCORE:
+            return best
+    return best
+
+
+## The gear the team is wearing right now, in the shape score_team() expects.
+func _probe_gear(team: PackedInt32Array) -> Array:
+    var gear := []
+    for ki in team:
+        var g := PackedInt32Array()
+        for it in knights[ki]["worn"]:
+            g.append(it)
+        gear.append(g)
+    return gear
+
+
+## True when failing this quest triggers a consequence of the given kind.
+func _fails_into(q, kind: int) -> bool:
+    for r in q.faillure_consequences:
+        if is_instance_valid(r) and r.reward_type == kind:
+            return true
+    if is_instance_valid(q.selected_modifier):
+        for r in q.selected_modifier.faillure_consequences_modification:
+            if is_instance_valid(r) and r.reward_type == kind:
+                return true
+    return false
+
+
+## What it costs the plan for a quest to RESOLVE AS A FAILURE.
+##
+## determine_rewards() picks its list with `success_rewards if outcome > 0 else
+## faillure_consequences` and looks no closer, so a failure, a major failure and a
+## critical failure all cost the SAME consequences - and an unstaffed quest whose
+## deadline expires costs them too. One number covers all of it.
+func _fail_cost(q) -> float:
+    if q.quest_type == Quest.QuestTypes.ULTIMATUM_QUEST:
+        return 100.0
+    if _fails_into(q, QuestReward.RewardType.LOCATION_DESTROYED):
+        return 100.0
+    if _fails_into(q, QuestReward.RewardType.CHARACTER_DEATH):
+        return 100.0
+    if not q.extra_conditions.is_empty():
+        return 30.0
+    if q.quest_type == Quest.QuestTypes.MAJOR_QUEST:
+        # A major quest has no scripted consequence, so the test below misses it - and
+        # its content is gone for good, gold and relic included.
+        return 8.0
+    if not q.faillure_consequences.is_empty():
+        return 6.0
+    # Nothing scripted happens. What is lost is the reward that was promised.
+    return 2.0
+
+
+## What it costs to leave a quest to NOBODY this cycle.
+##
+## Almost every quest simply waits, and skipping one is a nudge at most. A quest whose
+## deadline expires now does not wait: it resolves unstaffed, as a critical failure,
+## consequences and all (Quest.determine_outcome, first branch). So skipping THAT one
+## costs exactly what failing it costs - no more, and no less.
+##
+## No more matters as much as no less. Charging a flat refusal here was my own first
+## fix and it was worse than the bug: a single knight dropped on a doomed emergency
+## dodged the penalty, changed nothing the quest resolves with, and paid for the
+## privilege in armour. The two costs have to be equal for the search to see that
+## sending nobody and sending a team that fails are the same act.
+func _skip_penalty(q) -> float:
+    # quests_manager decrements the counter BEFORE judging the quest, so 1 means this
+    # cycle is the last one it has.
+    var deadline: bool = bool(q.has_deadline)
+    var last_chance: bool = deadline and int(q.remaining_cycles_before_faillure) <= 1
+    if q.quest_type == Quest.QuestTypes.ULTIMATUM_QUEST:
+        return 100.0
+    if last_chance:
+        return _fail_cost(q)
+    # Still time. These are urgency, not consequence: a looming deadline should pull
+    # the quest forward without commandeering the cycle, and forcing one always cost
+    # a whole cycle when two of them were open at once.
+    if deadline and _fails_into(q, QuestReward.RewardType.LOCATION_DESTROYED):
+        return 12.0
+    if not q.extra_conditions.is_empty():
+        return 30.0
+    if deadline and q.quest_type == Quest.QuestTypes.MAJOR_QUEST:
+        return 8.0
+    if deadline and not q.faillure_consequences.is_empty():
+        return 6.0
+    return 0.5
+
+
+## What winning this quest actually pays, in the same units as everything else.
+##
+## Only ever asked of a quest on its LAST cycle, where the question stops being "what
+## does failing cost" and becomes "what is gone for good". `_fail_cost` answers the
+## first and knows nothing of the second: quest_victoria_gank carries no failure
+## consequence at all, so walking away from it was priced at 2 points - while winning
+## it handed over two relics and a branch of the story.
+func _reward_worth(q) -> float:
+    var rewards := []
+    for r in q.success_rewards:
+        rewards.append(r)
+    if is_instance_valid(q.selected_modifier):
+        for r in q.selected_modifier.success_rewards_modification:
+            rewards.append(r)
+    var v := 0.0
+    for r in rewards:
+        if not is_instance_valid(r):
+            continue
+        # `amount` exists only on the variants that have one - the resource builds its
+        # property list from `reward_type` - so the type is read first, never a field.
+        var t: int = int(r.reward_type)
+        if (t == QuestReward.RewardType.RELIC or t == QuestReward.RewardType.MOUNT
+                or t == QuestReward.RewardType.QUEST_ITEM):
+            v += 6.0
+        elif t == QuestReward.RewardType.CONSUMABLE:
+            v += 1.0
+        elif t == QuestReward.RewardType.FUNDS:
+            v += float(r.amount) * 0.02
+        elif t == QuestReward.RewardType.SATISFACTION:
+            v += float(r.amount)
+        elif (t == QuestReward.RewardType.CHARACTER_TAG
+                or t == QuestReward.RewardType.SOVEREIGN_TAG):
+            v += 3.0
+        else:
+            # A story variable, a follow-up audience, a tax: worth having, and the mod
+            # has no honest way to price a branch of the plot any finer than that.
+            v += 2.0
+    return v
+
+
+## What the quests absent from a plan cost it.
+func _skipped_cost(staffed: Dictionary) -> float:
+    var c := 0.0
+    for qi in range(quests.size()):
+        if not staffed.has(qi):
+            c += float(quests[qi]["skip_pen"])
+    return c
 
 
 func _add_item(eq) -> int:
@@ -219,35 +453,70 @@ const BANNED := ["WISH_GRANTING_LAMP"]
 ## the equipment itself. The value carries the requirement: when its `item` is set,
 ## the thing is bought with a QUEST ITEM and not with gold, and advising it as if it
 ## cost money sends the player after a demon heart they do not have.
+## Whether the shop will actually sell this, or is showing it behind a padlock.
+##
+## The three tests are the game's own, lifted from shop_slot.gd - the very code that
+## draws the lock - rather than reimplemented. KELPIE was being advised at 160 gold
+## while the stable had it gated behind Scholars 15, which is exactly the kind of
+## advice that is worse than none.
+func _requirement_met(req) -> bool:
+    if not is_instance_valid(req):
+        return true
+    # `population_category`, `county_id` and `sovereign_tag` only EXIST on their own
+    # variant - the resource builds its property list from `type` - so the type is
+    # read first, never the field.
+    match int(req.type):
+        EquipmentRequirement.Types.None:
+            return true
+        EquipmentRequirement.Types.Satisfaction:
+            var sm = GameState.satisfaction_manager
+            var cat: String = sm.convert_population_category_to_string(
+                req.population_category)
+            return sm.is_satisfaction_high_enough(cat, int(req.amount))
+        EquipmentRequirement.Types.County:
+            var wm = GameState.world_manager
+            var county = wm.get_county_by_id(req.county_id)
+            return is_instance_valid(county) and county in wm.rallied_counties
+        EquipmentRequirement.Types.SovereignTag:
+            var tag: String = TagManager.get_string_from_sovereign_tag(req.sovereign_tag)
+            return GameState.sovereign_manager.does_sovereign_has_tag(tag, int(req.amount))
+    return true
+
+
 func _stock() -> Array:
     var im = GameState.inventory_manager
-    var act := 1
-    var am = GameState.act_manager
-    if "current_act" in am:
-        act = int(am.current_act)
     var out := []
-    for base in ["forge_relics", "stables_mounts", "witch_tower_consumables"]:
-        for a in range(1, act + 1):
-            var prop: String = base if a == 1 else "%s_act_%d" % [base, a]
-            if not (prop in im):
+    # The game merges its own act tiers, in get_forge_items() and its two siblings.
+    # Rebuilding that here was an off-by-one that emptied the shops outright: Acts.ONE
+    # is 0, so the old `for a in range(1, act + 1)` ran ZERO iterations through the
+    # whole of act I - the mod went a full playthrough without ever advising a
+    # purchase - and act II silently missed its own tier. Asked, not rebuilt.
+    var shelves := []
+    for getter in ["get_forge_items", "get_stables_items", "get_witch_tower_items"]:
+        if im.has_method(getter):
+            shelves.append(im.call(getter))
+    for d in shelves:
+        if not (d is Dictionary):
+            continue
+        for eq in d:
+            if not is_instance_valid(eq):
                 continue
-            var d = im.get(prop)
-            if not (d is Dictionary):
+            if String(eq.name) in BANNED:
                 continue
-            for eq in d:
-                if not is_instance_valid(eq):
-                    continue
-                if String(eq.name) in BANNED:
-                    continue
-                var kind: int = int(eq.equipment_type)
-                # Consumables are single use and the player arbitrates those; the mod
-                # cannot place them anyway.
-                if kind != Equipment.EquipmentsTypes.RELIC                         and kind != Equipment.EquipmentsTypes.MOUNT:
-                    continue
-                var req = d[eq]
-                if is_instance_valid(req) and "item" in req and int(req.item) != 0:
-                    continue
-                out.append({"ref": eq, "cost": int(eq.cost)})
+            var kind: int = int(eq.equipment_type)
+            # Consumables are single use and the player arbitrates those; the mod
+            # cannot place them anyway.
+            if (kind != Equipment.EquipmentsTypes.RELIC
+                    and kind != Equipment.EquipmentsTypes.MOUNT):
+                continue
+            # An entry whose cost is ANOTHER relic is a trade-in, and the mod has no
+            # way to weigh what it would be giving up. Left to the player.
+            var req = d[eq]
+            if is_instance_valid(req) and "item" in req and int(req.item) != 0:
+                continue
+            if not _requirement_met(req):
+                continue
+            out.append({"ref": eq, "cost": int(eq.cost)})
     return out
 
 
@@ -299,10 +568,17 @@ func duration_of(qi: int, team: PackedInt32Array, gear: Array,
     var q = quests[qi]
     if q["ultimatum"]:
         return 1
-    var slowest := -1
-    var bayard := -1
+    # A reduction can be NEGATIVE - GUIGNOL carries -1 and lengthens the quest - so
+    # "not set yet" cannot be spelled as -1. It was, and every negative reduction was
+    # quietly rounded back up to zero: the planner and the shop advice both believed
+    # a mount that costs the team a cycle was free, and the panel kept offering it.
+    var slowest := 0
+    var have := false
+    var bayard := 0
+    var has_bayard := false
     for j in range(team.size()):
         var red := 0
+        var is_bayard := false
         var chars: Dictionary = (chars_by_member[j] if j < chars_by_member.size()
                                  else chars_of(team[j], gear[j]))
         for it in gear[j]:
@@ -313,12 +589,16 @@ func duration_of(qi: int, team: PackedInt32Array, gear: Array,
             elif t == TagManager.CharacterTags.KELPIE and q["coastal"]:
                 red += 1
             elif t == TagManager.CharacterTags.BAYARD:
-                bayard = red
-        if slowest < 0 or red < slowest:
+                is_bayard = true
+        # The game reads the Bayard carrier's reduction once the characteristics have
+        # all been counted, not in the middle of counting them.
+        if is_bayard:
+            bayard = red
+            has_bayard = true
+        if not have or red < slowest:
             slowest = red
-    if slowest < 0:
-        slowest = 0
-    if slowest < bayard:
+            have = true
+    if has_bayard and slowest < bayard:
         slowest = bayard
     return maxi(1, q["base_d"] - slowest)
 
@@ -328,12 +608,19 @@ func duration_of(qi: int, team: PackedInt32Array, gear: Array,
 ## being considered, with gear it is not wearing.
 func special_fires(qi: int, team: PackedInt32Array, gear: Array,
                    stats_by_member: Array = [], chars_by_member: Array = []) -> bool:
+    return special_hit(qi, team, gear, stats_by_member, chars_by_member) != null
+
+
+## The outcome that fires, so it can be GRADED rather than merely counted. Returns
+## null when none of them does.
+func special_hit(qi: int, team: PackedInt32Array, gear: Array,
+                 stats_by_member: Array = [], chars_by_member: Array = []):
     var q = quests[qi]["ref"]
     var pot: Array = q.special_outcomes.duplicate()
     if is_instance_valid(q.selected_modifier):
         pot.append_array(q.selected_modifier.unexpected_outcomes)
     if pot.is_empty():
-        return false
+        return null
     var refs := []
     for ki in team:
         refs.append(knights[ki]["ref"])
@@ -341,8 +628,49 @@ func special_fires(qi: int, team: PackedInt32Array, gear: Array,
         if not is_instance_valid(so):
             continue
         if _outcome_met(so, team, gear, refs, stats_by_member, chars_by_member):
-            return true
-    return false
+            return so
+    return null
+
+
+## What an unexpected outcome is actually worth.
+##
+## SPECIAL_SCORE for every one of them was the old answer, and `magpie_goberto` is
+## why it could not stand: 100 damage, no reward whatsoever, and the search rated it
+## above any critical success it could have had instead. An unexpected outcome is not
+## a prize, it is just an outcome - and one of them is a funeral.
+##
+## Only the bad ones are re-priced. Anything that is not clearly a loss keeps the old
+## value, so this can remove a catastrophe from a plan but never quietly reshuffle a
+## good one.
+func _outcome_worth(so, qi: int, team: PackedInt32Array) -> float:
+    # The outcome brings its OWN damage range and it replaces the quest's
+    # (Quest.determine_damages), dealt to everyone sent. Against a knight's armour,
+    # that is the whole question.
+    if is_instance_valid(so.damage_range) and quests[qi]["lethal"]:
+        var hit: int = int(so.damage_range.max)
+        for ki in team:
+            if hit >= int(knights[ki]["armor"]):
+                return -DEATH_PENALTY
+    var net := 0.0
+    for r in so.rewards:
+        if not is_instance_valid(r):
+            continue
+        var t: int = r.reward_type
+        if (t == QuestReward.RewardType.LOCATION_DESTROYED
+                or t == QuestReward.RewardType.CHARACTER_DEATH
+                or t == QuestReward.RewardType.CURRENT_KNIGHT_DEMISSION):
+            return -DEATH_PENALTY
+        elif t == QuestReward.RewardType.FUNDS:
+            net += float(r.amount) * 0.02
+        elif (t == QuestReward.RewardType.SATISFACTION
+                or t == QuestReward.RewardType.AFFINITY):
+            net += float(r.amount)
+        else:
+            # An item, a story variable, an audience: worth having.
+            net += 2.0
+    if net < 0.0:
+        return net
+    return SPECIAL_SCORE
 
 
 func _outcome_met(so, team: PackedInt32Array, gear: Array, refs: Array,
@@ -353,6 +681,24 @@ func _outcome_met(so, team: PackedInt32Array, gear: Array, refs: Array,
     # An outcome that names nobody never triggers.
     if so.knights.is_empty():
         return false
+    # A TYPED outcome OVERRIDES are_conditions_met() outright - Gwendan's weighs
+    # is_reformed, Arron's weighs his state - and everything below this point knows
+    # nothing about that. It saw "the outcome names Gwendan", answered yes, and the
+    # search went chasing a 99-point outcome the quest was never going to produce:
+    # Gwendan came back nailed to a contract worth 0.69.
+    #
+    # None of those subclasses look at equipment, so the game can simply be asked -
+    # which is what this file should have done from the start. Only the BASE class
+    # needs the port below, because only it tests statistics and traits, and those do
+    # move with gear a candidate team is not yet wearing.
+    var scr = so.get_script()
+    if scr != null and String(scr.resource_path).get_file() != "special_outcome.gd":
+        # Array[Knight], not Array. Handed a plain one, are_conditions_met() answers
+        # "no" on a quest that does trigger - this mod has paid for that twice.
+        var typed: Array[Knight] = []
+        for k in refs:
+            typed.append(k)
+        return so.are_conditions_met(typed)
     if so.for_traitor_plot:
         var traitor = GameState.character_manager.traitors_plot_manager.get_traitor()
         for k in so.knights:
@@ -405,8 +751,10 @@ func score_team(qi: int, team: PackedInt32Array, gear: Array,
         stats_by.append(stats_of(team[j], gear[j]))
         chars_by.append(chars_of(team[j], gear[j]))
     var dur := duration_of(qi, team, gear, chars_by)
-    if special_fires(qi, team, gear, stats_by, chars_by):
-        return {"score": SPECIAL_SCORE, "special": true, "duration": dur}
+    var hit = special_hit(qi, team, gear, stats_by, chars_by)
+    if hit != null:
+        return {"score": _outcome_worth(hit, qi, team), "special": true,
+                "duration": dur}
 
     var nb: int = q["nb"]
     var divider: float = 1.0 + min(0, float(team.size() - 1)) / 2.0
@@ -469,7 +817,7 @@ func score_team(qi: int, team: PackedInt32Array, gear: Array,
                     unknown_bonus[t] = -1.0
 
         var cases: Dictionary = _special.for_knight(knights[ki]["ref"], q["ref"], chars,
-                                                    refs, q["base_d"], dur, stats)
+                                                    refs, q["raw_d"], dur, stats)
         for tag in cases:
             var sc2: float = float(cases[tag]["score"])
             if bool(cases[tag]["known"]):
@@ -529,8 +877,24 @@ func verify_inputs() -> Array:
         for st_ in range(NSTATS):
             var theirs: int = k.get_statistic_value_from_id(st_, true)
             if mine[st_] != theirs:
-                problems.append("%s: stat %s = %d, game says %d" % [
-                    knights[ki]["id"], Knight.Statistics.keys()[st_], mine[st_], theirs])
+                # The gap alone said nothing usable: with an empty board every knight
+                # matched, so the fault is in what the gear contributes, not in the
+                # base. So the line now carries the breakdown - base, then each worn
+                # item and what it is credited with - which is the only way to see
+                # WHICH item is being under-counted.
+                var parts := PackedStringArray()
+                parts.append("base %d" % int(knights[ki]["base"][st_]))
+                for it in gear:
+                    parts.append("%s %+d" % [items[it]["name"],
+                                             int(items[it]["stats"][ki][st_])])
+                var game_items := PackedStringArray()
+                for eq in k.equipments:
+                    if is_instance_valid(eq):
+                        game_items.append("%s %+d" % [String(eq.resource_path).get_file(),
+                                                      int(eq.get_stat_value(st_, k))])
+                problems.append("%s: stat %s = %d, game says %d\n      mine: %s\n      game: %s" % [
+                    knights[ki]["id"], Knight.Statistics.keys()[st_], mine[st_], theirs,
+                    ", ".join(parts), ", ".join(game_items)])
         var my_chars := chars_of(ki, gear)
         var their_chars: Dictionary = k.get_all_characteristics()
         for t in my_chars:
@@ -630,9 +994,35 @@ func verify_against_scoring() -> Array:
 #   2. the score itself;
 #   3. affinity gained, purely to break ties.
 
+## An outcome at or below -10 deals 100 damage to everyone sent
+## (Quest.determine_damages), which on a quest that can be lethal is a funeral, not a
+## setback. Nothing a plan can win is worth one, so this is a veto rather than a
+## weight.
+const DEATH_PENALTY := 200.0
+
 const ONE_CYCLE_BONUS := 8.0
 const DURATION_WEIGHT := 1.5
 const AFFINITY_TIEBREAK := 0.0002
+
+## How much a purchase has to be worth before it is mentioned at all. Below this it
+## is noise: a tenth of a point for a hundred gold is not a recommendation.
+const BUY_MIN_GAIN := 0.30
+
+## How close an ultimatum has to be before its price is put aside. The player's own
+## rule: two cycles out or less.
+const ULTIMATUM_HORIZON := 2
+
+## What it costs a plan to come home without a deadline it could still have won.
+##
+## Large enough that no ordinary quest outbids it: on its last cycle, a winnable quest
+## comes first. It is charged identically whether the quest is left empty or handed a
+## team that loses, so the only way out from under it is to actually win.
+const LAST_CHANCE_PRIORITY := 100.0
+
+## Ceiling on the winnability probe, in teams scored, for the whole cycle.
+const PROBE_EVALS := 20000
+
+var _probe_left := 0
 # Kept PER TEAM SIZE, not overall. The one-cycle bonus is paid per knight, so a
 # single ranked list is swept by the biggest teams and every solo falls off the end
 # - and a solo is exactly what lets a fourth quest be staffed when ten knights have
@@ -652,6 +1042,41 @@ const MAX_CLIMB_PASSES := 40
 
 var _nodes := 0
 var _qv_memo := {}
+
+## Free memory, in MB, below which the planner stops climbing and ships what it has.
+##
+## A minidump settled what guesswork could not: the process had committed 36 GB on a
+## 32 GB machine, in private regions of 3.7, 6.3, 9.5 and 14.3 GB - something growing
+## without bound and being copied on every reallocation - and died writing into a page
+## the system had refused to commit. Until that growth is found and stopped, this turns
+## a lost session into a slightly worse plan.
+const MEMORY_FLOOR_MB := 3000
+
+
+## Free physical memory in MB, or -1 when the engine will not say.
+func _free_mb() -> int:
+    if not OS.has_method("get_memory_info"):
+        return -1
+    var info: Dictionary = OS.get_memory_info()
+    # "available" is what this process may still commit; "free" is the machine's idle
+    # RAM. The first is the one that runs out.
+    var v = info.get("available", info.get("free", -1))
+    if typeof(v) != TYPE_INT and typeof(v) != TYPE_FLOAT:
+        return -1
+    if float(v) < 0.0:
+        return -1
+    return int(float(v) / 1048576.0)
+
+
+## Ceiling on that cache, in entries.
+##
+## It had none, and that is what killed the game: the equipment climb asks about a
+## different loadout every time, so with 42 items in the pool it minted a fresh key
+## per attempt and the dictionary grew without end. The trace showed it plainly -
+## climbs slowing from 70 ms to 5.8 s, then the process gone without an error line,
+## which is what running out of memory looks like. Emptying it costs a few repeated
+## evaluations; not emptying it costs the session.
+const QV_MEMO_MAX := 200000
 # The level-up advice raises a statistic without touching the team or the gear, so
 # the cache key would not change and every trial would get the same stale answer.
 var _memo_off := false
@@ -755,12 +1180,41 @@ func quest_value(qi: int, team: PackedInt32Array, gear: Array,
     var base_d: int = quests[qi]["base_d"]
     var real_d: int = int(r["duration"])
     var v: float = float(r["score"])
-    v += DURATION_WEIGHT * float(team.size()) * float(base_d - real_d)
-    # Winning a cycle while failing the quest is not winning anything.
-    if base_d > 1 and real_d <= 1 and (bool(r["special"]) or float(r["score"]) > 0.0):
-        v += ONE_CYCLE_BONUS * float(team.size())
+    # An unexpected outcome is not scored at all, and it is never a failure.
+    var outcome: int = (Quest.QuestOutcomes.UNEXPECTED_OUTCOME if bool(r["special"])
+                        else _scoring.outcome_for_score(quests[qi]["ref"],
+                                                        float(r["score"])))
+    if outcome > 0:
+        # Cycles saved only count on a quest that is going to be WON. Three cycles cut
+        # off a failure save nothing, and paying a mount for them is precisely how one
+        # knight alone on a doomed emergency came to look like a good idea: -4.73 for
+        # the quest, +4.5 for the mount that shortened it, and the search called it
+        # progress.
+        v += DURATION_WEIGHT * float(team.size()) * float(base_d - real_d)
+        if base_d > 1 and real_d <= 1:
+            v += ONE_CYCLE_BONUS * float(team.size())
+    else:
+        # Sending a team that FAILS spares the quest nothing: determine_rewards() hands
+        # out the same consequences an empty quest would have triggered. Charging it
+        # here too makes walking away and failing cost the same, which is what stops a
+        # knight being posted to dodge a penalty he does not actually dodge.
+        if bool(quests[qi]["winnable"]):
+            # Exactly what walking away costs, to the point. A quest that CAN be won
+            # on its last cycle has to be won: a team that loses it forfeits precisely
+            # what an empty quest forfeits, so the search can never buy its way out by
+            # posting someone doomed - the shape of the worst bug this mod has had.
+            v -= LAST_CHANCE_PRIORITY
+        else:
+            # Nothing left to save. What is forfeited is forfeited either way, so the
+            # two costs stay equal and walking away stays honest.
+            v -= float(quests[qi]["fail_cost"]) + float(quests[qi]["lost"])
+        if outcome == Quest.QuestOutcomes.CRITICAL_FAILURE and quests[qi]["lethal"]:
+            v -= DEATH_PENALTY * float(team.size())
     v += AFFINITY_TIEBREAK * _affinity_gain(team, r)
     if not _memo_off:
+        if _qv_memo.size() >= QV_MEMO_MAX:
+            _trace("memo: %d entries, cleared" % _qv_memo.size())
+            _qv_memo.clear()
         _qv_memo[key] = v
     return v
 
@@ -914,8 +1368,11 @@ func _assign(order: Array, teams: Dictionary, at: int, used: Dictionary,
         current.resize(current.size() - 1)
         for ki in cand["team"]:
             used.erase(ki)
-    # Leaving a quest empty is always allowed: a bad team is worse than none.
-    _assign(order, teams, at + 1, used, current, running, best)
+    # Leaving a quest empty is still allowed - a bad team is often worse than none -
+    # but it is no longer free. See _skip_penalty(): a deadline expiring this cycle
+    # makes walking away cost more than any team could be worth.
+    _assign(order, teams, at + 1, used, current,
+            running - float(quests[qi]["skip_pen"]), best)
 
 
 # ------------------------------------------------------------ equipment
@@ -1073,18 +1530,136 @@ func _slot_item(g: PackedInt32Array, slot: int) -> int:
 ## for fifty gold. Only two things earn a recommendation: an item that lifts a quest
 ## into a better outcome, and one that brings a quest down to a single cycle. That is
 ## the same bar the meal has to clear.
+## Why the buying advice said what it said.
+##
+## "You never told me to buy anything" has two possible causes and they need telling
+## apart: either the shops hold nothing that helps, or the mod cannot SEE the stock.
+## This prints both - the stock as the mod reads it, and what the best purchase would
+## actually do to the board as it stands.
+func shop_report() -> String:
+    var out := PackedStringArray()
+    var gold := 0
+    var fm = GameState.funds_manager
+    if "current_funds" in fm:
+        gold = int(fm.current_funds)
+    out.append("gold %d | %d for sale | %d in the pool" % [gold, for_sale.size(),
+                                                           pool.size()])
+    # The reserve either fires or it does not, and "it did not" has three possible
+    # causes. They are printed rather than guessed at.
+    var um = GameState.ultimatums_manager
+    if um == null or not ("has_current_ultimatum" in um) or not um.has_current_ultimatum:
+        out.append("ultimatum: none registered")
+    else:
+        var ult = um.current_ultimatum
+        if not is_instance_valid(ult):
+            out.append("ultimatum: flagged, but no resource")
+        else:
+            var conds := PackedStringArray()
+            for c in ult.selected_conditions_set:
+                if not is_instance_valid(c):
+                    continue
+                var t: int = int(c.type)
+                if t == QuestExtraCondition.Types.MIN_FUNDS:
+                    conds.append("MIN_FUNDS %d" % int(c.amount))
+                elif t == QuestExtraCondition.Types.MIN_RALLIED_COUNTIES:
+                    conds.append("MIN_RALLIED_COUNTIES")
+                else:
+                    conds.append("SATISFACTION")
+            out.append("ultimatum: %s | targeted cycle %d, now %d | %s | reserve %d" % [
+                String(ult.ultimatum_id), int(ult.targeted_cycle_index),
+                int(GameState.current_cycle_index),
+                ("no condition" if conds.is_empty() else ", ".join(conds)),
+                gold_floor()])
+    for it in for_sale:
+        out.append("  %-30s %5d gold%s" % [items[it]["name"],
+                   int(items[it].get("cost", 0)),
+                   ("" if int(items[it].get("cost", 0)) <= gold else "   (too dear)")])
+    # The board as it stands, not the last plan: the question is about what is on
+    # screen right now.
+    for qi in range(quests.size()):
+        var team := PackedInt32Array()
+        var gear := []
+        for k in quests[qi]["ref"].assigned_knights:
+            if is_instance_valid(k) and by_ref.has(k):
+                var ki: int = by_ref[k]
+                team.append(ki)
+                var g := PackedInt32Array()
+                for x in knights[ki]["worn"]:
+                    g.append(x)
+                gear.append(g)
+        if team.is_empty():
+            continue
+        var now := score_team(qi, team, gear)
+        out.append("%s  now %.2f" % [String(quests[qi]["id"]).substr(0, 40),
+                                     float(now["score"])])
+        var best := {}
+        for it in for_sale:
+            var slot: int = items[it]["slot"]
+            for j in range(team.size()):
+                if _slot_welded(team[j], slot):
+                    continue
+                var trial := []
+                for g2 in gear:
+                    trial.append(g2)
+                var replaced := _without_slot(trial[j], slot)
+                replaced.append(it)
+                trial[j] = replaced
+                var after := score_team(qi, team, trial)
+                var delta: float = float(after["score"]) - float(now["score"])
+                if best.is_empty() or delta > float(best["delta"]):
+                    best = {"delta": delta, "name": items[it]["name"],
+                            "who": knights[team[j]]["id"],
+                            "cost": int(items[it].get("cost", 0))}
+        if best.is_empty():
+            out.append("    nothing on sale fits")
+        else:
+            out.append("    best buy: %s for %s, %d gold -> %+.2f (%.2f)" % [
+                String(best["name"]), String(best["who"]).to_upper(),
+                int(best["cost"]), float(best["delta"]),
+                float(now["score"]) + float(best["delta"])])
+    return "\n".join(out)
+
+
+## Gold that must not be spent.
+##
+## An ultimatum can carry a MIN_FUNDS extra condition: hold that much on the day and
+## the quest is worth +2, miss it and it is not. The mod was recommending relics with
+## the very gold the ultimatum was going to ask for. The Python planner called this
+## its GOLD_FLOOR; this is the same idea, applied only once the ultimatum is close
+## enough for the money to be genuinely spoken for.
+func gold_floor() -> int:
+    var um = GameState.ultimatums_manager
+    if um == null or not ("has_current_ultimatum" in um):
+        return 0
+    if not um.has_current_ultimatum:
+        return 0
+    var ult = um.current_ultimatum
+    if not is_instance_valid(ult):
+        return 0
+    var due: int = int(ult.targeted_cycle_index) - int(GameState.current_cycle_index)
+    if due > ULTIMATUM_HORIZON:
+        return 0
+    var kept := 0
+    for c in ult.selected_conditions_set:
+        # `amount` only exists on the MIN_FUNDS variant - the class builds its
+        # property list from `type` - so the type is checked first, not after.
+        if is_instance_valid(c) and int(c.type) == QuestExtraCondition.Types.MIN_FUNDS:
+            kept = maxi(kept, int(c.amount))
+    return kept
+
+
 func _buy_advice(picks: Array, gear: Array) -> Array:
     var gold := 0
     var fm = GameState.funds_manager
     if "current_funds" in fm:
         gold = int(fm.current_funds)
+    gold = maxi(0, gold - gold_floor())
     var found := []
     for it in for_sale:
         var cost: int = int(items[it].get("cost", 0))
         if cost > gold:
             continue
         var slot: int = items[it]["slot"]
-        var best := {}
         for pi in range(picks.size()):
             var qi: int = picks[pi]["quest"]
             var team: PackedInt32Array = picks[pi]["team"]
@@ -1104,35 +1679,79 @@ func _buy_advice(picks: Array, gear: Array) -> Array:
                 var tier_after := (99 if bool(after["special"])
                                    else _tier_of(qi, float(after["score"])))
                 var cycles_saved: int = int(before["duration"]) - int(after["duration"])
-                if tier_after <= tier_before and cycles_saved <= 0:
+                var gain: float = 0.0
+                if not bool(after["special"]) and not bool(before["special"]):
+                    gain = float(after["score"]) - float(before["score"])
+                # A tier crossed or a cycle saved is still the strongest reason to
+                # buy. But requiring one of those was the CONSUMABLE rule applied to
+                # permanent gear, and it kept a whole shop quiet: on a board sitting
+                # at 8.69 and 9.11, the best relics were worth +0.69 and +0.36 and
+                # the panel said "nothing to buy". A relic is bought once and kept,
+                # so a lasting gain earns its own mention.
+                # An item that LENGTHENS the quest is never advice, whatever it
+                # adds to the score. GUIGNOL costs 15 gold, carries a
+                # duration_reduction of -1, and the panel was offering it for +2.25
+                # on a quest that was going to take ONE cycle and would then have
+                # taken two. The team's duration is set by its slowest knight, so a
+                # single such mount costs every knight on the quest a cycle - and
+                # cycles come before score.
+                if cycles_saved < 0:
                     continue
-                if best.is_empty() or tier_after - tier_before > int(best["tiers"])                         or cycles_saved > int(best["cycles"]):
-                    best = {"knight": knights[team[j]]["id"],
-                            "quest_id": quests[qi]["id"],
-                            "tiers": tier_after - tier_before,
-                            "cycles": cycles_saved,
-                            "to": _tier_name(tier_after)}
-        if best.is_empty():
-            continue
-        best["name"] = items[it]["name"]
-        best["cost"] = cost
-        # `for` and `path` are the names the panel already reads, so the line renders
-        # the same whichever planner produced it.
-        best["for"] = best["knight"]
-        best["path"] = String(items[it]["ref"].resource_path)
-        found.append(best)
+                if tier_after <= tier_before and cycles_saved <= 0 and gain < BUY_MIN_GAIN:
+                    continue
+                # EVERY carrier is kept, not just this item's best one. Keeping only
+                # the best made CLAYMORE vanish outright: its best carrier was ARI,
+                # ARI's relic slot went to the hunting bow, and the claymore was only
+                # offered to GIDEON on the NEXT press - after the bow had actually
+                # been bought. Which knight carries what is the selection's business,
+                # further down, because that is where the free slots are known.
+                found.append({
+                    "item": it,
+                    "knight": knights[team[j]]["id"],
+                    "quest_id": quests[qi]["id"],
+                    "tiers": tier_after - tier_before,
+                    "cycles": cycles_saved,
+                    "gain": gain,
+                    "slot": slot,
+                    "to": _tier_name(tier_after),
+                    "name": items[it]["name"],
+                    "cost": cost,
+                    # `for` and `path` are the names the panel already reads, so the
+                    # line renders the same whichever planner produced it.
+                    "for": knights[team[j]]["id"],
+                    "path": String(items[it]["ref"].resource_path),
+                })
     # Cheapest first among equal gains, and never advise more than the purse holds.
     found.sort_custom(func(a, b):
         if int(a["cycles"]) != int(b["cycles"]):
             return int(a["cycles"]) > int(b["cycles"])
         if int(a["tiers"]) != int(b["tiers"]):
             return int(a["tiers"]) > int(b["tiers"])
+        if not is_equal_approx(float(a["gain"]), float(b["gain"])):
+            return float(a["gain"]) > float(b["gain"])
         return int(a["cost"]) < int(b["cost"]))
     var spent := 0
     var affordable := []
+    # One knight, one relic and one mount. Advising three swords for ARI - which is
+    # exactly what the first version did, 265 gold for a single slot - is not advice,
+    # it is a shopping list nobody can use. The best gain per knight and slot wins;
+    # the others are dropped rather than re-ranked, because their figures were all
+    # measured against the gear he is wearing NOW, not against each other.
+    var taken := {}
+    var bought := {}
     for f in found:
+        # One copy of each item, and one item per knight and slot. The list is sorted
+        # best-first, so the first carrier reached for an item is the best one whose
+        # slot is still free.
+        if bought.has(int(f["item"])):
+            continue
+        var slot_key := "%s/%d" % [String(f.get("knight", "")), int(f.get("slot", -1))]
+        if taken.has(slot_key):
+            continue
         if spent + int(f["cost"]) > gold:
             continue
+        bought[int(f["item"])] = true
+        taken[slot_key] = true
         spent += int(f["cost"])
         affordable.append(f)
     return affordable
@@ -1319,22 +1938,50 @@ func plan_step(budget_ms: int) -> bool:
         return _stage == 2
     var until := Time.get_ticks_msec() + budget_ms
     var t0 := Time.get_ticks_usec()
+    var free_mb := _free_mb()
+    _trace("step: enter (%d MB free, memo %d)" % [free_mb, _qv_memo.size()])
+    # The floor is checked before any work, not after: once the allocator is against
+    # the wall the next copy is the one that kills the process.
+    if free_mb >= 0 and free_mb < MEMORY_FLOOR_MB:
+        _trace("step: MEMORY FLOOR reached (%d MB) - stopping with %d climb(s) done"
+               % [free_mb, _climbs])
+        _stage = 2
+        return true
     while _finalist_at < _finalists.size():
         var cand = _finalists[_finalist_at]
         _finalist_at += 1
+        # Built int by int rather than through String(PackedInt32Array). That
+        # conversion asks the engine to size a buffer from the array's own header,
+        # and it is exactly where the process died allocating 14 GB - so it is the
+        # one call in this loop worth not making. Cheaper too: no intermediate
+        # "[1, 2, 3]" per team.
         var sig := ""
         for c in cand["picks"]:
-            sig += "%d:%s;" % [int(c["quest"]), String(c["team"])]
+            sig += str(int(c["quest"]))
+            sig += ":"
+            for ki in c["team"]:
+                sig += str(int(ki))
+                sig += ","
+            sig += ";"
         if _climbed.has(sig):
             continue
         _climbed[sig] = true
         _climbs += 1
-        _trace("climb %d/%d (%d picks)" % [_climbs, _finalists.size(), cand["picks"].size()])
+        _trace("climb %d/%d (%d picks, memo %d)" % [_climbs, _finalists.size(),
+                                                       cand["picks"].size(),
+                                                       _qv_memo.size()])
         var g := _optimise_gear(cand["picks"])
-        _trace("climb %d done" % _climbs)
+        _trace("climb %d done (%d MB free)" % [_climbs, _free_mb()])
         var v := 0.0
+        var staffed := {}
         for pi in range(cand["picks"].size()):
+            staffed[int(cand["picks"][pi]["quest"])] = true
             v += quest_value(cand["picks"][pi]["quest"], cand["picks"][pi]["team"], g[pi])
+        # The search charged every quest left empty; this comparison has to charge for
+        # them as well, or the finalist that walks away from the emergency wins here
+        # after losing there.
+        v -= _skipped_cost(staffed)
+        _trace("climb %d valued %.2f" % [_climbs, v])
         if v > _value_best:
             _value_best = v
             _pick_best = cand["picks"]
@@ -1342,6 +1989,8 @@ func plan_step(budget_ms: int) -> bool:
         if Time.get_ticks_msec() >= until:
             break
     _t_gear += Time.get_ticks_usec() - t0
+    _trace("step: leave at %d/%d (%d MB free)" % [
+        _finalist_at, _finalists.size(), _free_mb()])
     if _finalist_at >= _finalists.size():
         _stage = 2
         return true
@@ -1361,6 +2010,8 @@ func _search() -> Array:
     _trace("plan: start")
     _prepare()
     _trace("plan: prepared, %d free knight(s), pool %d" % [free_knights.size(), pool.size()])
+    _settle_last_chance()
+    _trace("plan: last chance settled")
     var teams := {}
     var order := []
     var t_teams := Time.get_ticks_usec()
@@ -1419,6 +2070,25 @@ func plan_result() -> Dictionary:
 
     var out := []
     var total := 0.0
+    var staffed := {}
+    for p in picks:
+        staffed[int(p["quest"])] = true
+    # A quest whose deadline expires this cycle and that the plan still leaves empty
+    # is a deliberate choice, and it must not be a silent one. It can be either of two
+    # very different choices - no team could have succeeded, or the knights were worth
+    # more elsewhere - so each one is measured below rather than assumed.
+    var missed := []
+    for qi2 in range(quests.size()):
+        if not quests[qi2]["last_chance"] or staffed.has(qi2):
+            continue
+        # WHY it was given up, measured. "No team could succeed" was printed over
+        # every abandoned deadline, including the ones abandoned because the knights
+        # were simply worth more elsewhere - a different statement, and here a false
+        # one: four knights scored a great success on the quest the panel had just
+        # declared unwinnable.
+        missed.append({"id": quests[qi2]["id"],
+                       "best": float(quests[qi2]["best_score"]),
+                       "winnable": bool(quests[qi2]["winnable"])})
     for pi in range(picks.size()):
         var qi: int = picks[pi]["quest"]
         var team: PackedInt32Array = picks[pi]["team"]
@@ -1460,7 +2130,8 @@ func plan_result() -> Dictionary:
             "base_duration": quests[qi]["base_d"],
             "value": v,
         })
-    return {"assignments": out, "buy": buy, "levels": levels,
+    return {"assignments": out, "buy": buy, "levels": levels, "missed": missed,
+            "gold_floor": gold_floor(),
             "meal": (null if meal.is_empty() else meal["knight"]),
             "meal_info": meal, "value": total,
             "us": Time.get_ticks_usec() - _t_start,

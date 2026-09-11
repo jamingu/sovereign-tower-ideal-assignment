@@ -45,10 +45,22 @@ const MAX_WAIT := 40
 const PLAN_MAX_WAIT := 300         # ticks of 0.3 s -> 90 s
 const SPINNER := ["|", "/", "-", "\\"]
 
-const COMMANDS := ["state", "assign", "report", "clear", "score2", "detail", "spec", "fast", "inputs", "plan2", "inkprobe", "probe2", "hints2", "levels2", "scene", "quests", "knights",
+## Every screen the ending runs through. It is not one scene but a chain of them -
+## the knights' epilogues, the closing dialogues, then the credits - so they are all
+## listed rather than guessed at from a parent node.
+const ENDING_SCRIPTS := [
+    "scenes/cutscene/servant_ending_cutscene_container.gd",
+    "scenes/rooms/dialogue_rooms/arlin_ending_dialogue_container.gd",
+    "scenes/rooms/dialogue_rooms/arlin_ending_dialogue.gd",
+    "scenes/rooms/dialogue_rooms/demon_ending_dialogue.gd",
+    "scenes/credits/credits.gd",
+]
+
+const COMMANDS := ["state", "assign", "report", "clear", "score2", "detail", "spec", "fast", "inputs", "plan2", "inkprobe", "probe2", "hints2", "levels2", "scene", "quests", "knights", "away", "shop",
                    "load", "table", "tree", "achievements", "clean_achievements",
                    "test_lock", "test_required", "wheel", "outcomes", "test_outcome",
-                   "scores", "options", "options_state", "choices", "test_choice"]
+                   "scores", "options", "options_state", "choices", "test_choice",
+                   "why"]
 
 ## Achievements fired by mistake during tuning: a "populate" command (since removed)
 ## recruited the whole round table at once, which unlocked the recruitment
@@ -78,13 +90,15 @@ const DEFAULTS := {
     "reward_names": true,
     "meal_likes": true,
     "fast_results": true,
+    "fast_ending": true,
+    "ending_speed": 3.0,
     "fix_ghost_portrait": true,
-    "result_speed": 2.0,
+    "result_speed": 4.0,
 }
 
 ## What the options screen offers to tick: setting key -> label, in display order.
 const OPTIONS := [
-    ["assignment_button", "Show the \"Ideal assignment\" button"],
+    ["assignment_button", "Show the \"Auto-assignement\" button"],
     ["clear_button", "Show the \"Clear all\" button"],
     ["wheel_numbers", "Show numbers on the difficulty wheel"],
     ["unexpected_outcomes", "Show unexpected outcomes"],
@@ -94,6 +108,7 @@ const OPTIONS := [
     ["reward_names", "Name the relic / mount / consumable a quest promises"],
     ["meal_likes", "Kitchen: flag the dishes a knight likes and dislikes"],
     ["fast_results", "Speed up the end-of-cycle results screen"],
+    ["fast_ending", "Speed up the ending sequence"],
     ["fix_ghost_portrait", "Round table: clear a portrait left behind by the swipe"],
     ["buying_advice", "Buying and meal advice"],
     ["test_bench", "Remote control (lets the assistant drive the game to test it)"],
@@ -105,6 +120,8 @@ var _layer: CanvasLayer
 var _panel: Panel
 var _button: Button
 var _clear_button: Button
+var _meal_button: Button
+var _train_button: Button
 var _status: Label
 var _outcome_label: Label
 var _quest_label: Label           # name of the quest the score belongs to
@@ -122,6 +139,7 @@ var _home: Node = null             # main menu
 var _tower: Node = null            # TowerViewContainer
 var _kitchen: Node = null          # Kitchen (meal selection)
 var _cycle_end: Node = null        # CycleTransitionContainer (end-of-cycle results)
+var _endings: Array[Node] = []     # the ending sequence, epilogues and credits
 var _wheels: Array[Node] = []      # difficulty wheels to annotate
 var _choices: Array[Node] = []     # audience choice buttons to annotate
 var _rewards_shown: Array[Node] = []   # reward chips on the quest card
@@ -436,8 +454,16 @@ func _update_score() -> void:
     # cycles, and nothing in this panel said so. calculate_updated_duration() is the
     # game's own function and only reads - it applies the team's mount reduction.
     var cycles: int = GameState.quests_manager.calculate_updated_duration(q)
-    _quest_label.text = "%s - %d cycle%s" % [tr(q.quest_name), cycles,
-                                             ("" if cycles == 1 else "s")]
+    var title := "%s - %d cycle%s" % [tr(q.quest_name), cycles,
+                                      ("" if cycles == 1 else "s")]
+    # A deadline is the one thing on this panel there is no recovering from: a quest
+    # left to nobody on the cycle its deadline expires resolves as a CRITICAL FAILURE
+    # before anything is scored, consequences included. The game files it under
+    # "urgent" and says nothing more, so it is spelled out here.
+    if q.has_deadline:
+        var left: int = int(q.remaining_cycles_before_faillure)
+        title += ("  -  LAST CYCLE" if left <= 1 else "  -  deadline in %d" % left)
+    _quest_label.text = title
     # A special outcome whose conditions are met SHORT-CIRCUITS the whole thing:
     # `determine_outcome()` returns UNEXPECTED_OUTCOME before scoring anything. The
     # figure would be meaningless, so we do not show one.
@@ -932,6 +958,64 @@ func _add_once(lines: PackedStringArray, line: String) -> void:
 
 ## What it takes to trigger an unexpected outcome, in the shortest readable form.
 ## Named knights first, then a required trait, then a statistic threshold.
+## What an unexpected outcome actually does, in one line.
+##
+## "UNEXPECTED OUTCOME" on its own reads like a jackpot, and it is not: the magpie
+## contract carries one that deals 100 damage and hands over nothing at all. The
+## player has to be able to tell those two apart BEFORE sending anyone.
+func _outcome_effect(special, quest) -> String:
+    var bits := PackedStringArray()
+    # The outcome brings its OWN damage range and it REPLACES the quest's, so the
+    # "1-2" printed on the card says nothing about it.
+    if is_instance_valid(special.damage_range):
+        var lo: int = int(special.damage_range.min)
+        var hi: int = int(special.damage_range.max)
+        if hi > 0:
+            var dmg := ("%d damage" % hi) if lo == hi else ("%d-%d damage" % [lo, hi])
+            # Held against the armour of the knights actually assigned: that is the
+            # difference between a scratch and a funeral.
+            if quest.quest_can_be_lethal and _would_kill(hi, quest):
+                dmg = "DEADLY, " + dmg
+            bits.append(dmg)
+    for r in special.rewards:
+        if not is_instance_valid(r):
+            continue
+        match r.reward_type:
+            QuestReward.RewardType.FUNDS:
+                bits.append("%d gold" % int(r.amount))
+            QuestReward.RewardType.SATISFACTION:
+                bits.append("%+d satisfaction" % int(r.amount))
+            QuestReward.RewardType.AFFINITY:
+                bits.append("%+d affinity" % int(r.amount))
+            QuestReward.RewardType.RELIC:
+                bits.append("a relic")
+            QuestReward.RewardType.MOUNT:
+                bits.append("a mount")
+            QuestReward.RewardType.CONSUMABLE:
+                bits.append("a consumable")
+            QuestReward.RewardType.QUEST_ITEM:
+                bits.append("a quest item")
+            QuestReward.RewardType.CURRENT_KNIGHT_DEMISSION:
+                bits.append("A KNIGHT RESIGNS")
+            QuestReward.RewardType.LOCATION_DESTROYED:
+                bits.append("A LOCATION IS DESTROYED")
+            QuestReward.RewardType.CHARACTER_DEATH:
+                bits.append("A DEATH")
+    # Story variables and special instructions leave no trace here on purpose: they
+    # are invisible to the player anyway, and naming them would spoil the scene.
+    if bits.is_empty():
+        return "no material effect"
+    return ", ".join(bits)
+
+
+## True when that much damage reaches the armour of anyone currently assigned.
+func _would_kill(damage: int, quest) -> bool:
+    for k in quest.assigned_knights:
+        if is_instance_valid(k) and damage >= int(k.current_armor):
+            return true
+    return false
+
+
 func _outcome_condition(special) -> String:
     var who := PackedStringArray()
     for k in special.knights:
@@ -1007,9 +1091,24 @@ func _outcome_text(quest) -> String:
         if not is_instance_valid(special):
             continue
         if special.are_conditions_met(quest.assigned_knights):
-            _add_once(lines, "Unexpected outcome: TRIGGERED by the current team")
+            _add_once(lines, "Unexpected outcome: TRIGGERED - %s"
+                             % _outcome_effect(special, quest))
         else:
-            _add_once(lines, "Unexpected outcome: needs %s" % _outcome_condition(special))
+            var txt := "Unexpected outcome: needs %s" % _outcome_condition(special)
+            # Naming a knight who is ALREADY on the quest reads as "it is armed", and
+            # it is not. Several outcomes are typed subclasses - Gwendan's tests
+            # is_reformed, Arron's tests his state - which weigh something on top of
+            # the knight's presence, and this panel only ever read the generic
+            # `knights` list. So the line said "needs Gwendan" with Gwendan sitting
+            # right there, one line under a score that said FAILURE.
+            #
+            # What the extra condition IS stays unsaid, on purpose: it often hangs on
+            # a trait the player has not discovered, and the panel announces the fact,
+            # never the recipe.
+            if _named_knights_present(special, quest):
+                txt += " - assigned, but another condition on them is not met"
+            txt += " (%s)" % _outcome_effect(special, quest)
+            _add_once(lines, txt)
     return "
 ".join(lines)
 
@@ -1058,8 +1157,8 @@ func _run_command(name: String) -> String:
             _on_pressed()
             # The solver now runs in the background: the report is not ready yet.
             # Ask again with "report" once the panel stops spinning.
-            return ("\"Ideal assignment\" pressed - computing in the background"
-                    if _plan_pending else "\"Ideal assignment\" pressed\n" + _last_report)
+            return ("\"Auto-assignement\" pressed - computing in the background"
+                    if _plan_pending else "\"Auto-assignement\" pressed\n" + _last_report)
         "report":
             return ("still computing (%ds)" % int(_plan_wait * 0.3)
                     if _plan_pending else _last_report)
@@ -1152,6 +1251,16 @@ func _run_command(name: String) -> String:
             return _dump_quests()
         "knights":
             return _dump_knights()
+        "away":
+            return _dump_ongoing()
+        "shop":
+            var sv2 = _new_solver()
+            if sv2 == null:
+                return "solver.gd could not be loaded"
+            sv2.snapshot()
+            return sv2.shop_report()
+        "why":
+            return _dump_why()
     return "not implemented: " + name
 
 
@@ -1467,6 +1576,99 @@ func _dump_knights() -> String:
     return ("round table empty" if out.size() == 0 else "\n".join(out))
 
 
+## Why a quest went to the knight it went to.
+##
+## Every knight, alone on every quest, with the value the planner puts on him and
+## whether the quest's unexpected outcome fires for him. A plan that looks wrong is
+## either a bug or a knight who was worth more elsewhere, and nothing short of the
+## two columns side by side tells the two apart.
+func _dump_why() -> String:
+    var sv = _new_solver()
+    if sv == null:
+        return "solver.gd could not be loaded"
+    sv.snapshot()
+    if sv.quests.is_empty():
+        return "no quest on the board"
+    var out := PackedStringArray()
+    for qi in range(sv.quests.size()):
+        var q: Dictionary = sv.quests[qi]
+        out.append("%s  (%d slot(s)%s)" % [String(q["id"]), int(q["nb"]),
+                                           (", lethal" if bool(q["lethal"]) else "")])
+        for ki in range(sv.knights.size()):
+            var team := PackedInt32Array()
+            team.append(ki)
+            var g := PackedInt32Array()
+            # Judged in the gear he is WEARING: that is the state the planner starts
+            # its own climb from, so anything else would answer a different question.
+            for it in sv.knights[ki]["worn"]:
+                g.append(it)
+            var gear := [g]
+            var hit = sv.special_hit(qi, team, gear)
+            var r: Dictionary = sv.score_team(qi, team, gear)
+            out.append("    %-10s value %9.2f   score %7.2f   %d cycle(s)%s" % [
+                String(sv.knights[ki]["id"]), float(sv.quest_value(qi, team, gear)),
+                float(r["score"]), int(r["duration"]),
+                ("   <- UNEXPECTED OUTCOME" if hit != null else "")])
+    return "\n".join(out)
+
+
+## The quests already under way, with the cycles they still owe and who is on them.
+##
+## Nothing outside the game can answer this: an ongoing quest has left
+## current_quests, and the save records neither its countdown nor its team. So the
+## question "how much longer is he away" had no answer at all until now.
+func _dump_ongoing() -> String:
+    var out := PackedStringArray()
+    for q in GameState.quests_manager.ongoing_quests:
+        if not is_instance_valid(q):
+            continue
+        var who := PackedStringArray()
+        for k in q.assigned_knights:
+            if is_instance_valid(k):
+                who.append(String(k.character_ink_id))
+        out.append("%-46s %d cycle(s) left  %s" % [
+            String(q.quest_id).substr(0, 46), _cycles_left(q), ", ".join(who)])
+    return ("no quest under way" if out.size() == 0 else "\n".join(out))
+
+
+## How many more cycle ends this quest needs.
+##
+## Simulated rather than derived: update_quests_duration() decrements FIRST and only
+## then re-applies the cycle modifier, with a max(0, ...) in between, so a quest with
+## a +1 modifier outlives its own counter by a cycle. Bounded, like every loop in
+## this mod - an unbounded one once took the game down with no log at all.
+func _cycles_left(q) -> int:
+    var d: int = int(q.duration)
+    var m := 0
+    if is_instance_valid(q.selected_modifier):
+        m = int(q.selected_modifier.duration_modification)
+    var n := 0
+    while n < 20:
+        n += 1
+        d -= 1
+        var total: int = d
+        if m != 0:
+            total = maxi(0, total + m)
+        if total <= 0:
+            return n
+    return n
+
+
+## True when every knight the outcome names is already on the quest.
+##
+## An outcome that names nobody is left alone: it never fires anyway, and its real
+## condition is a trait or a statistic that this test says nothing about.
+func _named_knights_present(special, quest) -> bool:
+    if special.knights.is_empty():
+        return false
+    for k in special.knights:
+        if not is_instance_valid(k):
+            continue
+        if not k in quest.assigned_knights:
+            return false
+    return true
+
+
 # ------------------------------------------------------------------ settings
 
 func _load_settings() -> void:
@@ -1578,24 +1780,53 @@ func _build_ui() -> void:
     _panel.add_child(margin)
 
     var box := VBoxContainer.new()
-    box.add_theme_constant_override("separation", 6)
+    box.add_theme_constant_override("separation", 3)
     box.mouse_filter = Control.MOUSE_FILTER_IGNORE
     margin.add_child(box)
     _box = box
 
+    # Two rows of two. The panel is narrow and the four actions belong together:
+    # stacking them pushed the score - the thing the player is actually here for -
+    # off the bottom of the box.
+    var row1 := HBoxContainer.new()
+    row1.add_theme_constant_override("separation", 3)
+    box.add_child(row1)
+
     _button = Button.new()
-    _button.text = "Ideal assignment"
-    _button.custom_minimum_size = Vector2(0, 52)
-    _style_button(_button, 22)
+    _button.text = "Auto-assignement"
+    _button.custom_minimum_size = Vector2(0, 48)
+    _button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    _style_button(_button, 19)
     _button.pressed.connect(_on_pressed)
-    box.add_child(_button)
+    row1.add_child(_button)
 
     _clear_button = Button.new()
-    _clear_button.text = "Clear all"
-    _clear_button.custom_minimum_size = Vector2(0, 44)
-    _style_button(_clear_button, 18)
+    _clear_button.text = "Clear"
+    _clear_button.custom_minimum_size = Vector2(0, 48)
+    _clear_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    _style_button(_clear_button, 19)
     _clear_button.pressed.connect(_on_clear_pressed)
-    box.add_child(_clear_button)
+    row1.add_child(_clear_button)
+
+    var row2 := HBoxContainer.new()
+    row2.add_theme_constant_override("separation", 3)
+    box.add_child(row2)
+
+    _meal_button = Button.new()
+    _meal_button.text = "Meal"
+    _meal_button.custom_minimum_size = Vector2(0, 40)
+    _meal_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    _style_button(_meal_button, 17)
+    _meal_button.pressed.connect(_on_meal_pressed)
+    row2.add_child(_meal_button)
+
+    _train_button = Button.new()
+    _train_button.text = "Train"
+    _train_button.custom_minimum_size = Vector2(0, 40)
+    _train_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    _style_button(_train_button, 17)
+    _train_button.pressed.connect(_on_train_pressed)
+    row2.add_child(_train_button)
 
     # Score first: it is the number the player is actually after. The advice below
     # is context, not the headline.
@@ -1624,6 +1855,165 @@ func _build_ui() -> void:
     # through (Label defaults to MOUSE_FILTER_IGNORE).
 
 
+## Feeds one knight, paying for the dish exactly as the kitchen would.
+##
+## Who eats follows the player's rule: the knight a meal would lift to a better
+## outcome, if the plan found one, and otherwise the lowest affinity on the table -
+## a meal is worth +0.5 to a score and +1.5 to affinity, so when it buys no tier it
+## is spent on the relationship that needs it most.
+func _on_meal_pressed() -> void:
+    _buttons_busy(true)
+    # Every path below leaves through here, so the panel can never stay locked.
+    _meal_apply()
+    _buttons_busy(false)
+
+
+func _meal_apply() -> void:
+    if not _room_open(Room.Room_ID.KITCHEN_ROOM):
+        _set_status("the kitchen is not open yet")
+        return
+    if _meal_served():
+        _set_status("a meal has already been served this cycle")
+        return
+    var knight = _meal_target()
+    if knight == null:
+        _set_status("no one left to feed")
+        return
+    var meal = _cheapest_liked_meal(knight)
+    if meal == null:
+        _set_status("no meal on the menu")
+        return
+    var cost: int = int(meal.cost)
+    var fm = GameState.funds_manager
+    if not fm.are_funds_sufficient(cost):
+        _set_status("%s costs %d gold, you have %d" % [
+            _item_label(String(meal.name)), cost, int(fm.current_funds)])
+        return
+    # Paid for, not conjured. give_meal() alone would hand out the score and the
+    # affinity for free, which is not the same game.
+    fm.update_funds(-cost)
+    knight.give_meal(meal)
+    # Annotated, never inferred: `in` over an untyped array has no set type, and a
+    # parse error here does not degrade the mod, it deletes it - the autoload fails
+    # and the panel simply never appears.
+    var liked: bool = meal.meal_ID in knight.known_liked_meals
+    _set_status("%s: %s, %d gold%s" % [
+        String(knight.character_ink_id).to_upper(), _item_label(String(meal.name)),
+        cost, ("" if liked else " (not a known favourite)")])
+
+
+## Whether the kitchen has already served this cycle.
+##
+## One meal per cycle for the whole table, which is the game's own rule: kitchen.gd
+## disables its cook button as soon as ANY knight has eaten. The counter resets on its
+## own - character_manager clears `has_eaten` on every knight when the cycle turns - so
+## the button comes back by itself and needs no bookkeeping here.
+func _meal_served() -> bool:
+    var cm = GameState.character_manager
+    var everyone = cm.recruitable_knights if "recruitable_knights" in cm else cm.roundtable_knights
+    for k in everyone:
+        if is_instance_valid(k) and k.has_eaten:
+            return true
+    return false
+
+
+## The knight the meal should go to, or null when there is nobody left to feed.
+func _meal_target():
+    var cm = GameState.character_manager
+    # The plan names a knight only when the meal actually lifts an outcome - and it
+    # stores a real null when it found none, which String() would turn into "<null>".
+    var named = _last_plan.get("meal")
+    var wanted: String = "" if named == null else String(named)
+    if wanted != "":
+        var k = cm.get_roundtable_knight_from_name(wanted)
+        if is_instance_valid(k) and not k.has_eaten and not k.is_dead:
+            return k
+    var best = null
+    for k in cm.roundtable_knights:
+        if not is_instance_valid(k) or k.is_dead or k.has_eaten:
+            continue
+        if best == null or float(k.current_affinity) < float(best.current_affinity):
+            best = k
+    return best
+
+
+## The cheapest dish this knight is KNOWN to like; the cheapest of any kind when none
+## of their tastes have been discovered yet - a meal still carries its +0.5 either way.
+func _cheapest_liked_meal(knight):
+    var menu = GameState.inventory_manager.available_meals
+    var liked = null
+    var any = null
+    for meal in menu:
+        if not is_instance_valid(meal):
+            continue
+        if any == null or int(meal.cost) < int(any.cost):
+            any = meal
+        if not meal.meal_ID in knight.known_liked_meals:
+            continue
+        if liked == null or int(meal.cost) < int(liked.cost):
+            liked = meal
+    return liked if liked != null else any
+
+
+## Sends the idlest, greenest knight to the training ground.
+##
+## Only knights with no quest are considered: the game clears `assigned_quest` when it
+## puts someone in training, so taking the lowest level outright would quietly pull a
+## knight out of a team the planner had just built.
+func _on_train_pressed() -> void:
+    _buttons_busy(true)
+    _train_apply()
+    _buttons_busy(false)
+
+
+func _train_apply() -> void:
+    if not _room_open(Room.Room_ID.TRAINING_GROUND):
+        _set_status("the training ground is not open yet")
+        return
+    var cm = GameState.character_manager
+    var best = null
+    for k in cm.roundtable_knights:
+        if not is_instance_valid(k) or k.is_dead:
+            continue
+        if is_instance_valid(k.assigned_quest):
+            continue
+        if best == null or int(k.current_level) < int(best.current_level) or (
+                int(k.current_level) == int(best.current_level)
+                and int(k.current_xp) < int(best.current_xp)):
+            best = k
+    if best == null:
+        _set_status("every knight is on a quest")
+        return
+    # One trainee at a time, which is the rule the training ground itself applies.
+    for k in cm.roundtable_knights:
+        if is_instance_valid(k):
+            k.is_training = (k == best)
+    _set_status("%s is training (level %d)" % [
+        String(best.character_ink_id).to_upper(), int(best.current_level)])
+
+
+## Locks the whole panel while one action runs, and unlocks it afterwards.
+##
+## Pressing Clear in the middle of a plan, or Meal twice in a row, acts on a board the
+## other action is still rearranging. The four buttons are one control surface and they
+## are enabled and disabled as one - except Meal, which stays out while the kitchen has
+## already served.
+func _buttons_busy(busy: bool) -> void:
+    for b in [_button, _clear_button, _train_button]:
+        if is_instance_valid(b):
+            b.disabled = busy
+    if is_instance_valid(_meal_button):
+        _meal_button.disabled = busy or _meal_served()
+
+
+## Whether a room of the tower is open for business.
+func _room_open(room_id: int) -> bool:
+    var tm = GameState.tower_manager
+    if tm == null or not tm.has_method("is_room_unlocked"):
+        return true
+    return bool(tm.is_room_unlocked(room_id))
+
+
 ## A faint rule between two sections of the panel.
 func _panel_rule(parent: Node) -> HSeparator:
     var sep := HSeparator.new()
@@ -1646,6 +2036,10 @@ func _panel_label(parent: Node, font_size: int, color: Color) -> Label:
     lab.size_flags_horizontal = Control.SIZE_EXPAND_FILL
     lab.add_theme_font_size_override("font_size", font_size)
     lab.add_theme_color_override("font_color", color)
+    # Godot leaves 3 px between the lines of a Label, which at this font size opened a
+    # visible hole between every entry of a list. The panel is a dense readout, not a
+    # page of prose.
+    lab.add_theme_constant_override("line_spacing", 0)
     parent.add_child(lab)
     return lab
 
@@ -2075,10 +2469,13 @@ snapshot in %d us - no quest has a team to check" % [summary, snap_us]
         if bool(r["special_fast"]) != bool(r["special_slow"]):
             flag = "SPECIAL OUTCOME DISAGREES"
         elif d > 0.005:
-            # Expected, not a fault: the game has not computed this quest's duration
-            # yet, so its own answer for these three tags is meaningless until the
-            # cycle resolves. See solver.gd, DURATION_TAGS.
-            flag = ("differs on a duration tag" if bool(r.get("duration_tags", false))
+            # This USED to be excused: the game leaves a quest's duration at -1 until
+            # the cycle resolves, so its own answer for these three tags was worth
+            # nothing and the two sides could not agree. scoring.gd now works the
+            # durations out itself (durations_of()), so both models grade them - and a
+            # gap here is a real fault again, on either side. The tag is still named,
+            # because it says where to look first. See solver.gd, DURATION_TAGS.
+            flag = ("DIFFERS - duration tag" if bool(r.get("duration_tags", false))
                     else "DIFFERS")
         lines.append("  %-44s fast %8.2f  game %8.2f  %dc  %s" % [
             String(r["id"]).substr(0, 44), float(r["fast"]), float(r["slow"]),
@@ -2460,6 +2857,22 @@ func _equipment_name(id: String) -> String:
     return id.capitalize()
 
 
+## An item's name as the player reads it, in the language the game is running in.
+##
+## `Equipment.name` holds a translation KEY - "CRAB_ARMOR", "HUNTING_BOW" - and not a
+## name, so printing it raw put English identifiers in a French game. `tr()` is the
+## game's own lookup, which makes the panel read exactly like the shop and the
+## inventory do, whatever the language. A key the table does not know comes back
+## unchanged; that is tidied into something readable rather than shown as an id.
+func _item_label(key: String) -> String:
+    if key == "":
+        return "?"
+    var shown := tr(key)
+    if shown != key and shown != "":
+        return shown
+    return key.capitalize()
+
+
 func _quest_name(qid: String) -> String:
     var q = GameState.quests_manager.get_quest_from_id(qid)
     if is_instance_valid(q):
@@ -2475,7 +2888,7 @@ func _finish_native_plan() -> void:
     _native = null
     _plan_pending = false
     if is_instance_valid(_button):
-        _button.disabled = false
+        _buttons_busy(false)
     var plan: Dictionary = solver.plan_result()
     if plan.get("assignments", []).is_empty():
         _set_status("no assignment found")
@@ -2607,15 +3020,34 @@ func _process(_delta: float) -> void:
         if _native.plan_step(12):
             _finish_native_plan()
 
-    var on_recap: bool = (settings.get("fast_results", false)
-                          and is_instance_valid(_cycle_end)
-                          and _cycle_end.is_visible_in_tree())
-    if on_recap:
-        var speed: float = maxf(1.0, float(settings.get("result_speed", 2.0)))
+    # One meal a cycle. Nothing signals the mod when the cycle turns and the game
+    # clears every appetite, so the button's state is read from the world each frame
+    # rather than remembered - it greys itself out and comes back on its own.
+    if is_instance_valid(_meal_button) and not _plan_pending:
+        _meal_button.disabled = _meal_served()
+
+    # Two screens want the same lever, so the strongest wins rather than the last
+    # one tested: they cannot be up at once today, and if that ever changes the
+    # player still gets the speed they asked for.
+    var speed := 1.0
+    if (settings.get("fast_results", false) and is_instance_valid(_cycle_end)
+            and _cycle_end.is_visible_in_tree()):
+        speed = maxf(speed, float(settings.get("result_speed", 4.0)))
+    if settings.get("fast_ending", false) and _ending_visible():
+        speed = maxf(speed, float(settings.get("ending_speed", 3.0)))
+    if speed > 1.0:
         Engine.time_scale = _player_speed() * speed
         _time_scale_ours = true
     elif _time_scale_ours:
         _restore_time_scale()
+
+
+## True while any screen of the ending chain is on display.
+func _ending_visible() -> bool:
+    for n in _endings:
+        if is_instance_valid(n) and n.is_visible_in_tree():
+            return true
+    return false
 
 
 func _restore_time_scale() -> void:
@@ -2661,6 +3093,10 @@ func _script_is(n: Node, suffix: String) -> bool:
 # FULL paths: "home.gd" alone also matched scenes/home/debug_menu_home.gd, and the
 # mod ended up driving the wrong screen.
 func _on_node_added(n: Node) -> void:
+    for path in ENDING_SCRIPTS:
+        if _script_is(n, path):
+            _endings.append(n)
+            break
     if _script_is(n, "scenes/roundtable/quests_presentation_section.gd"):
         _section = n
         # Not while a plan is being computed: clearing the board rebuilds this
@@ -2697,6 +3133,11 @@ func _on_node_removed(n: Node) -> void:
     elif n == _cycle_end:
         _cycle_end = null
         _restore_time_scale()
+    elif n in _endings:
+        _endings.erase(n)
+        # One screen of the chain closing does not mean the ending is over: the next
+        # one is usually already up, and _process puts the speed back on its own.
+        _restore_time_scale()
 
 
 # ------------------------------------------------------------------ the button
@@ -2707,7 +3148,7 @@ func _on_pressed() -> void:
         return
     if _plan_pending:
         return
-    _button.disabled = true
+    _buttons_busy(true)
     # Always start from an empty board. Applying on top of an existing assignment left
     # leftovers behind: a knight the plan does not use stayed on his quest, and gear the
     # plan wanted was still worn by someone else, so it could not be handed over.
@@ -2730,7 +3171,7 @@ func _on_pressed() -> void:
         return
     # No solver.gd: fall back on the external program, which still works.
     if not _start_solver():
-        _button.disabled = false
+        _buttons_busy(false)
         return
     _plan_pending = true
     _plan_wait = 0
@@ -2862,7 +3303,7 @@ func _poll_solver() -> void:
             _native = null
             _plan_pending = false
             if is_instance_valid(_button):
-                _button.disabled = false
+                _buttons_busy(false)
             _set_status("the planner timed out")
             return
         _tick_loader()
@@ -2870,7 +3311,7 @@ func _poll_solver() -> void:
     if FileAccess.file_exists(PLAN_PATH):
         _plan_pending = false
         if is_instance_valid(_button):
-            _button.disabled = false
+            _buttons_busy(false)
         var plan := _read_plan()
         if plan.is_empty():
             return
@@ -2885,7 +3326,7 @@ func _poll_solver() -> void:
     if _plan_wait > PLAN_MAX_WAIT:
         _plan_pending = false
         if is_instance_valid(_button):
-            _button.disabled = false
+            _buttons_busy(false)
         _set_status("the solver timed out")
         return
     _tick_loader()
@@ -2916,12 +3357,12 @@ func _on_clear_pressed() -> void:
     if not is_instance_valid(_section):
         _set_status("round table not found")
         return
-    _clear_button.disabled = true
+    _buttons_busy(true)
     var freed := _clear_assignments()
     var stripped := _unequip_all()
     _last_report = "%d knight(s) removed, %d item(s) returned" % [freed, stripped]
     _set_status("")
-    _clear_button.disabled = false
+    _buttons_busy(false)
 
 
 # ------------------------------------------------------------ clearing the board
@@ -2944,7 +3385,22 @@ func _clear_assignments() -> int:
                 continue
             _section._unassign_knight_from_quest(k)
             freed += 1
+    # The game's own unassign only redraws the slots of the quest that happens to be
+    # SELECTED - every other card keeps showing knights that are no longer on it. The
+    # board was genuinely empty and the screen said otherwise, which is the same thing
+    # as being broken from where the player sits.
+    _refresh_board()
     return freed
+
+
+## Redraws what the model already says: the quest cards and the knight portraits.
+func _refresh_board() -> void:
+    if not is_instance_valid(_section):
+        return
+    if _section.has_method("update_quest_presentations"):
+        _section.update_quest_presentations()
+    if _section.has_method("update_knight_vignettes"):
+        _section.update_knight_vignettes()
 
 
 ## Returns every worn item to stock.
@@ -3060,7 +3516,8 @@ func _apply(plan: Dictionary) -> String:
             # shop shelf is not in the player's inventory.
             if not _item_available(res):
                 if not bool(item.get("owned", true)):
-                    to_buy.append(String(item.get("name", item.get("id", "?"))))
+                    to_buy.append(_item_label(String(item.get("name",
+                                                            item.get("id", "")))))
                 continue
             if _equip(knight, res):
                 equipped += 1
@@ -3157,16 +3614,78 @@ func _update_advice(plan: Dictionary) -> void:
         purchases.append(a)
         spend += int(a.get("cost", 0))
     var lines := PackedStringArray()
+    # A deadline the plan gives up on comes FIRST, above the shopping. It is a
+    # deliberate choice - no team could have succeeded, and a team that fails costs
+    # the very same consequences plus its armour - but the player is the one who gets
+    # to overrule it, so it cannot be a silent one.
+    var kept: int = int(plan.get("gold_floor", 0))
+    if kept > 0:
+        lines.append("Keeping %d gold for the ultimatum" % kept)
+    for m in plan.get("missed", []):
+        # The GDScript planner now says WHY; a plan read from a file carries a bare id.
+        var qid := ""
+        var known := typeof(m) == TYPE_DICTIONARY
+        if known:
+            qid = String(m.get("id", ""))
+        else:
+            qid = String(m)
+        lines.append("Deadline given up: %s" % _quest_name(qid))
+        if not known or not bool(m.get("winnable", false)):
+            lines.append("  no team could succeed - sending one would cost the same")
+        else:
+            lines.append("  a team could win it (%.2f) - the others were worth more"
+                         % float(m.get("best", 0.0)))
+    var edith_on := _edith_kill_quest(plan)
+    if edith_on != "":
+        lines.append("EDITH on %s - a killing quest" % edith_on)
+        lines.append("  it changes her for good, and there is no going back")
     if purchases.is_empty():
         lines.append("Nothing to buy")
     else:
         lines.append("To buy (%d gold):" % spend)
         for a in purchases:
-            lines.append("  - %s: %d gold for %s" % [
-                String(a.get("name", "?")), int(a.get("cost", 0)),
-                String(a.get("for", "?")).to_upper()])
+            # The gain is shown because it is the whole reason the line exists:
+            # most purchases do not cross a tier, they just make a knight better.
+            var why := ""
+            if a.has("gain") and float(a["gain"]) > 0.0:
+                why = " (+%.2f)" % float(a["gain"])
+            if int(a.get("tiers", 0)) > 0:
+                why = " -> %s" % String(a.get("to", ""))
+            lines.append("  - %s: %d gold for %s%s" % [
+                _item_label(String(a.get("name", ""))), int(a.get("cost", 0)),
+                String(a.get("for", "?")).to_upper(), why])
     _advice_label.text = "
 ".join(lines)
+
+
+## The quest in the plan that would change EDITH for good, "" when there is none.
+##
+## `_check_for_edith()` fires the moment she is assigned to a quest whose
+## `involve_killing` is set - once, permanently, before any dice are rolled. It is
+## not a risk to be weighed against a score, so the mod does not weigh it: it says so
+## and leaves the choice where it belongs.
+func _edith_kill_quest(plan: Dictionary) -> String:
+    var edith = GameState.character_manager.get_knight_from_name("edith")
+    if not is_instance_valid(edith):
+        return ""
+    # Already changed: there is nothing left to warn about.
+    if "is_possessed" in edith and bool(edith.is_possessed):
+        return ""
+    for a in plan.get("assignments", []):
+        var here := false
+        for n in a.get("knights", []):
+            if String(n) == "edith":
+                here = true
+                break
+        if not here:
+            continue
+        # The GDScript planner carries the resource; a plan read from a file does not.
+        var q = a.get("quest_ref")
+        if not is_instance_valid(q):
+            q = GameState.quests_manager.get_quest_from_id(String(a.get("quest_id", "")))
+        if is_instance_valid(q) and bool(q.involve_killing):
+            return _quest_name(String(a.get("quest_id", "")))
+    return ""
 
 
 ## Shows a rule only where it actually separates two visible sections, and hides a
