@@ -34,25 +34,6 @@ var _special = null         # special.gd
 var _scoring = null         # scoring.gd
 
 
-## Diagnostic trail, opened and closed on every line so it survives a hard crash -
-## print() sits in a buffer that a crash takes with it, which is exactly when the
-## last line matters. Off unless someone sets trace_on.
-var trace_on := false
-
-
-func _trace(msg: String) -> void:
-    if not trace_on:
-        return
-    var f := FileAccess.open("user://sovereign_mod/trace.txt", FileAccess.READ_WRITE)
-    if f == null:
-        f = FileAccess.open("user://sovereign_mod/trace.txt", FileAccess.WRITE)
-    if f == null:
-        return
-    f.seek_end()
-    f.store_line("%d  %s" % [Time.get_ticks_msec(), msg])
-    f.close()
-
-
 func setup(special_mod, scoring_mod) -> void:
     _special = special_mod
     _scoring = scoring_mod
@@ -209,8 +190,6 @@ func _settle_last_chance() -> void:
         quests[qi]["winnable"] = win
         if win:
             quests[qi]["skip_pen"] = LAST_CHANCE_PRIORITY
-        _trace("plan: last chance %s -> best %.2f, winnable %s (%d eval left)" % [
-            String(quests[qi]["id"]), best, str(win), _probe_left])
     # Teams were priced while `winnable` was still false everywhere.
     _qv_memo.clear()
 
@@ -1213,7 +1192,6 @@ func quest_value(qi: int, team: PackedInt32Array, gear: Array,
     v += AFFINITY_TIEBREAK * _affinity_gain(team, r)
     if not _memo_off:
         if _qv_memo.size() >= QV_MEMO_MAX:
-            _trace("memo: %d entries, cleared" % _qv_memo.size())
             _qv_memo.clear()
         _qv_memo[key] = v
     return v
@@ -1939,12 +1917,9 @@ func plan_step(budget_ms: int) -> bool:
     var until := Time.get_ticks_msec() + budget_ms
     var t0 := Time.get_ticks_usec()
     var free_mb := _free_mb()
-    _trace("step: enter (%d MB free, memo %d)" % [free_mb, _qv_memo.size()])
     # The floor is checked before any work, not after: once the allocator is against
     # the wall the next copy is the one that kills the process.
     if free_mb >= 0 and free_mb < MEMORY_FLOOR_MB:
-        _trace("step: MEMORY FLOOR reached (%d MB) - stopping with %d climb(s) done"
-               % [free_mb, _climbs])
         _stage = 2
         return true
     while _finalist_at < _finalists.size():
@@ -1967,11 +1942,7 @@ func plan_step(budget_ms: int) -> bool:
             continue
         _climbed[sig] = true
         _climbs += 1
-        _trace("climb %d/%d (%d picks, memo %d)" % [_climbs, _finalists.size(),
-                                                       cand["picks"].size(),
-                                                       _qv_memo.size()])
         var g := _optimise_gear(cand["picks"])
-        _trace("climb %d done (%d MB free)" % [_climbs, _free_mb()])
         var v := 0.0
         var staffed := {}
         for pi in range(cand["picks"].size()):
@@ -1981,7 +1952,6 @@ func plan_step(budget_ms: int) -> bool:
         # them as well, or the finalist that walks away from the emergency wins here
         # after losing there.
         v -= _skipped_cost(staffed)
-        _trace("climb %d valued %.2f" % [_climbs, v])
         if v > _value_best:
             _value_best = v
             _pick_best = cand["picks"]
@@ -1989,8 +1959,6 @@ func plan_step(budget_ms: int) -> bool:
         if Time.get_ticks_msec() >= until:
             break
     _t_gear += Time.get_ticks_usec() - t0
-    _trace("step: leave at %d/%d (%d MB free)" % [
-        _finalist_at, _finalists.size(), _free_mb()])
     if _finalist_at >= _finalists.size():
         _stage = 2
         return true
@@ -2007,11 +1975,8 @@ func plan() -> Dictionary:
 func _search() -> Array:
     var t0 := Time.get_ticks_usec()
     _t_start = t0
-    _trace("plan: start")
     _prepare()
-    _trace("plan: prepared, %d free knight(s), pool %d" % [free_knights.size(), pool.size()])
     _settle_last_chance()
-    _trace("plan: last chance settled")
     var teams := {}
     var order := []
     var t_teams := Time.get_ticks_usec()
@@ -2021,12 +1986,10 @@ func _search() -> Array:
             continue
         teams[qi] = list
         order.append(qi)
-        _trace("plan: quest %d -> %d team(s)" % [qi, list.size()])
     order.sort_custom(func(a, b): return float(teams[a][0]["v"]) > float(teams[b][0]["v"]))
     t_teams = Time.get_ticks_usec() - t_teams
 
     var t_search := Time.get_ticks_usec()
-    _trace("plan: search begins over %d quest(s)" % order.size())
     var best := []
     _nodes = 0
     _cut = -INF
@@ -2040,14 +2003,12 @@ func _search() -> Array:
     _assign(order, teams, 0, {}, [], 0.0, best)
     _t_teams = t_teams
     _t_search = Time.get_ticks_usec() - t_search
-    _trace("plan: search done, %d node(s), %d candidate(s)" % [_nodes, best.size()])
     best.sort_custom(func(a, b): return float(a["value"]) > float(b["value"]))
     if best.size() > PLANS_KEPT:
         best.resize(PLANS_KEPT)
     return best
 
     t_search = Time.get_ticks_usec() - t_search
-    _trace("plan: search done, %d node(s), %d candidate(s)" % [_nodes, best.size()])
     best.sort_custom(func(a, b): return float(a["value"]) > float(b["value"]))
     if best.size() > PLANS_KEPT:
         best.resize(PLANS_KEPT)
@@ -2066,7 +2027,6 @@ func plan_result() -> Dictionary:
     var meal := _meal_advice(picks, gear)
     var buy := _buy_advice(picks, gear)
     var levels := _level_advice(picks, gear)
-    _trace("plan: done")
 
     var out := []
     var total := 0.0

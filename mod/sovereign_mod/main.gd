@@ -2444,7 +2444,6 @@ func _new_solver():
         return null
     var s = SV.new()
     s.setup(SP, SC)
-    s.trace_on = bool(settings.get("trace", false))
     return s
 
 
