@@ -557,17 +557,18 @@ func _collect_scores() -> void:
 ##
 ## Order matters: "REUSSITE CRITIQUE" has to be replaced before "REUSSITE", or the
 ## longer label would be mangled into "CRITICAL SUCCESS CRITIQUE".
-## Statistic names as the GAME shows them, not as the engine names them. The wheel
-## reads FOR / AGI / CHA / MAG / INT / FRT, so "WITS" in our own panel had the player
-## looking for a stat that does not exist on screen.
-const STAT_LABEL := {
-    "STRENGTH": "FOR", "AGILITY": "AGI", "CHARISMA": "CHA",
-    "MAGIC": "MAG", "WITS": "INT", "LUCK": "FRT",
-}
-
-
+## Statistic names as the GAME shows them, in the language the player is playing in.
+## The wheel reads FOR / AGI / CHA / MAG / INT / FRT in French and STR / AGI / CHA /
+## MAG / WIT / LCK in English, and the game builds both from "<STAT>_ABBREVIATION".
+## Hard-coding one language's labels was wrong for everyone else: a player on an
+## English game asked why the panel said FOR. Ask the game instead. tr() hands back
+## the key itself when there is no entry, which is our signal to fall back.
 func _stat_label(name: String) -> String:
-    return String(STAT_LABEL.get(name, name))
+    var key := name + "_ABBREVIATION"
+    var short := tr(key)
+    if short.is_empty() or short == key:
+        return name
+    return short
 
 
 const OUTCOME_FR_EN := [
